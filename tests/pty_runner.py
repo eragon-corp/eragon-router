@@ -2,24 +2,87 @@
 
 import os, sys, json, tempfile, pathlib, pty, select, time, termios, subprocess
 request = json.load(sys.stdin)
+# The Gateway key the fixture clients expect; sign-in tests use an esk_ key.
+KEY = request.get('fixtureKey', 'fixture-secret')
 with tempfile.TemporaryDirectory() as directory:
     root = pathlib.Path(directory)
     (root / "eragon.sh").write_text(request["script"])
+    log = root / "log"
+    log.mkdir()
     curl = root / "curl"
     curl.write_text(r"""#!/usr/bin/env python3
-import os, sys
+import os, sys, json, pathlib
+log = pathlib.Path(os.environ['FIXTURE_LOG'])
+args = sys.argv[1:]
+url = args[args.index('--url') + 1]
+stdin = sys.stdin.read()
+with open(log / 'curl.jsonl', 'a') as record:
+    record.write(json.dumps({'argv': sys.argv, 'url': url, 'post': '--data-binary' in args}) + '\n')
 assert all('fixture-secret' not in arg for arg in sys.argv)
-assert os.environ.get('EXPECT_NO_CATALOGUE') != '1'
+# Sign-in tokens (ecli_) and device codes (edc_) never travel as arguments.
+assert all('ecli_' not in arg and 'edc_' not in arg for arg in sys.argv), 'sign-in secret in curl arguments'
+assert all('ecli_' not in value and 'edc_' not in value for value in os.environ.values()), 'sign-in secret in curl environment'
 assert sys.argv[1] == '-q'
-assert sys.argv[sys.argv.index('--url') + 1] == os.environ['EXPECTED_ENDPOINT'] + '/v1/models'
 assert '--location' not in sys.argv and '-L' not in sys.argv
-assert sys.stdin.read() == 'Authorization: Bearer fixture-secret\n'
+assert args[args.index('--proto') + 1] == '=https'
 assert 'eragon_key' not in os.environ
 assert 'ERAGON_API_KEY' not in os.environ
-if os.environ.get('CURL_FAIL') == '1': sys.exit(22)
-print('FIXTURE_CATALOGUE_REQUEST', file=sys.stderr)
-print(os.environ['MODEL_RESPONSE'])
+if url.endswith('/v1/models'):
+    assert os.environ.get('EXPECT_NO_CATALOGUE') != '1'
+    assert url == os.environ['EXPECTED_ENDPOINT'] + '/v1/models'
+    assert stdin == 'Authorization: Bearer fixture-secret\n'
+    if os.environ.get('CURL_FAIL') == '1': sys.exit(22)
+    print('FIXTURE_CATALOGUE_REQUEST', file=sys.stderr)
+    print(os.environ['MODEL_RESPONSE'])
+    sys.exit(0)
+# Eragon sign-in endpoints, answered from the request's "eragon" fixture.
+assert os.environ.get('FIXTURE_ERAGON'), 'unexpected request to ' + url
+eragon = json.loads(pathlib.Path(os.environ['FIXTURE_ERAGON']).read_text())
+base = os.environ['EXPECTED_ERAGON_URL']
+assert url.startswith(base + '/v1/'), url
+path = url[len(base):]
+post = '--data-binary' in args
+write_out = args[args.index('--write-out') + 1]
+def answer(entry):
+    if entry.get('network'):
+        print('curl: (7) Failed to connect (fixture)', file=sys.stderr); sys.exit(7)
+    body = entry.get('body', '')
+    sys.stdout.write(body if isinstance(body, str) else json.dumps(body))
+    sys.stdout.write(write_out.replace('\\n', '\n').replace('%{http_code}', str(entry.get('code', 200))))
+    sys.exit(0)
+def bearer():
+    assert stdin.startswith('Authorization: Bearer ') and stdin.count('\n') == 1 and stdin.endswith('\n'), 'token must arrive as one header on stdin'
+    return stdin[len('Authorization: Bearer '):-1]
+if path == '/v1/auth/device/start':
+    assert post and args[args.index('--data-binary') + 1] == '@-'
+    label = json.loads(stdin)['label']
+    assert label.startswith('eragon-router (') and label.isascii() and label.isprintable() and len(label) <= 120, label
+    with open(log / 'labels', 'a') as record: record.write(label + '\n')
+    answer(eragon['start'])
+if path == '/v1/auth/device/token':
+    assert post and args[args.index('--data-binary') + 1] == '@-'
+    assert json.loads(stdin) == {'deviceCode': eragon['start']['body']['deviceCode']}
+    counter = log / 'polls'
+    index = int(counter.read_text()) if counter.exists() else 0
+    counter.write_text(str(index + 1))
+    polls = eragon.get('polls', [])
+    answer(polls[index] if index < len(polls) else {'code': 500, 'body': {'error': 'fixture exhausted'}})
+if path == '/v1/me':
+    assert not post
+    answer(eragon.get('me', {}).get(bearer(), {'code': 401, 'body': {'error': 'unauthorized'}}))
+if path == '/v1/gateway-keys':
+    assert not post, 'the router must never create Gateway keys'
+    assert bearer() in eragon.get('me', {}), 'keys listed with an unconfirmed sign-in'
+    answer(eragon.get('keys', {'body': []}))
+raise AssertionError('unexpected request to ' + url)
 """)
+    # Polling waits are recorded, and skipped unless a test needs real time.
+    sleep = root / "sleep"
+    sleep.write_text('#!/bin/sh\nprintf \'%s\\n\' "$1" >> "$FIXTURE_LOG/sleeps"\n'
+                     'if [ "${FIXTURE_REAL_SLEEP:-0}" = 1 ]; then exec /bin/sleep "$1"; fi\n')
+    # Never open a real browser: record what would have been opened.
+    for opener in ["open", "xdg-open"]:
+        (root / opener).write_text('#!/bin/sh\nprintf \'%s %s\\n\' "${0##*/}" "$*" >> "$FIXTURE_LOG/opened"\n')
     claude = root / "claude"
     claude.write_text("""#!/usr/bin/env python3
 import os, sys, json
@@ -139,6 +202,7 @@ print('OPENCODE_LAUNCHED ' + json.dumps(config))
 if os.environ.get('EXPECT_MEMORY_ON_PATH') == '1':
     import shutil, pathlib
     assert shutil.which('eragon-context-mcp') == str(pathlib.Path(os.environ['XDG_DATA_HOME']) / 'eragon-router' / 'memory' / 'node_modules' / '.bin' / 'eragon-context-mcp')
+assert not any('ecli_' in value or 'edc_' in value for value in os.environ.values()), 'sign-in secret in client environment'
 """
         marker = "assert os.environ['ANTHROPIC_AUTH_TOKEN'] == 'fixture-secret'" if client_path == claude else "assert os.environ['ERAGON_ROUTER_TOKEN'] == 'fixture-secret'"
         client_path.write_text(source.replace(marker, check + marker, 1))
@@ -152,6 +216,7 @@ assert len(sys.argv) == 6 and sys.argv[3] in ['claude-code','codex','pi','openco
 assert sys.argv[5] == os.environ['EXPECTED_ENDPOINT']
 assert all('fixture-secret' not in arg for arg in sys.argv)
 assert 'eragon_key' not in os.environ
+assert not any('ecli_' in value or 'edc_' in value for value in os.environ.values())
 if sys.argv[3] == 'claude-code':
     assert os.environ['ANTHROPIC_AUTH_TOKEN'] == 'fixture-secret'
     assert 'ERAGON_API_KEY' not in os.environ
@@ -172,6 +237,7 @@ assert '--ignore-scripts' in sys.argv and '--no-audit' in sys.argv and '--no-fun
 assert sys.argv[-1] == 'https://github.com/eragon-corp/eragon-context-mcp/archive/575d1617d181f2fcaefa91f648dee111a2959cb1.tar.gz'
 for name in ['ERAGON_API_KEY','ERAGON_ROUTER_TOKEN','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_API_KEY','OPENAI_API_KEY','eragon_key']:
     assert name not in os.environ, name
+assert not any('ecli_' in value or 'edc_' in value for value in os.environ.values())
 assert all('fixture-secret' not in arg for arg in sys.argv)
 if os.environ.get('FIXTURE_NPM_FAIL') == '1': sys.exit(1)
 p = pathlib.Path(sys.argv[3]) / 'node_modules' / '.bin' / 'eragon-context-mcp'
@@ -196,16 +262,32 @@ if os.environ.get('CHECK_MEMORY_CHILD') == '1':
 """
         source = source.replace("assert os.environ['ERAGON_ROUTER_TOKEN'] == 'fixture-secret'", "assert os.environ['ERAGON_ROUTER_TOKEN'] == 'fixture-secret'\n" + check, 1)
         client_path.write_text(source)
-    for path in [curl, claude, codex, pi, opencode]: path.chmod(0o700)
+    for path in [curl, claude, codex, pi, opencode, bridge_installer, npm, memory_bridge]:
+        path.write_text(path.read_text().replace('fixture-secret', KEY))
+    for path in [curl, claude, codex, pi, opencode, sleep, root / 'open', root / 'xdg-open']: path.chmod(0o700)
     environment = dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'],
         MODEL_RESPONSE=request['models'], CURL_FAIL=str(request.get('curlFail', 0)),
         ANTHROPIC_API_KEY='stale', CLAUDE_CODE_DISABLE_THINKING='1')
     # Do not accidentally use credentials/config from the developer's shell.
-    for name in ['ERAGON_API_KEY', 'ERAGON_ENDPOINT', 'ERAGON_MODEL', 'eragon_key', 'endpoint', 'selected', 'ERAGON_COMPATIBILITY_FILE', 'ERAGON_CONTEXT_WINDOW', 'CLAUDE_CODE_AUTO_COMPACT_WINDOW', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE', 'FIXTURE_CLAUDE_VERSION', 'FIXTURE_CODEX_VERSION', 'ERAGON_CLIENT', 'ERAGON_ROUTER_TOKEN', 'ERAGON_GATEWAY_URL', 'CHECK_MEMORY_CHILD', 'ERAGON_ROUTER_PI_CONFIG', 'OPENCODE_CONFIG_CONTENT', 'FIXTURE_PI_VERSION', 'FIXTURE_OPENCODE_VERSION', 'FIXTURE_PI_EXIT', 'FIXTURE_PI_MCP', 'FIXTURE_NODE_VERSION', 'FIXTURE_NPM_FAIL', 'FIXTURE_REGISTER_FAIL']:
+    for name in ['ERAGON_API_KEY', 'ERAGON_ENDPOINT', 'ERAGON_MODEL', 'eragon_key', 'endpoint', 'selected', 'ERAGON_COMPATIBILITY_FILE', 'ERAGON_CONTEXT_WINDOW', 'CLAUDE_CODE_AUTO_COMPACT_WINDOW', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE', 'FIXTURE_CLAUDE_VERSION', 'FIXTURE_CODEX_VERSION', 'ERAGON_CLIENT', 'ERAGON_ROUTER_TOKEN', 'ERAGON_GATEWAY_URL', 'CHECK_MEMORY_CHILD', 'ERAGON_ROUTER_PI_CONFIG', 'OPENCODE_CONFIG_CONTENT', 'FIXTURE_PI_VERSION', 'FIXTURE_OPENCODE_VERSION', 'FIXTURE_PI_EXIT', 'FIXTURE_PI_MCP', 'FIXTURE_NODE_VERSION', 'FIXTURE_NPM_FAIL', 'FIXTURE_REGISTER_FAIL',
+                 'ERAGON_URL', 'ERAGON_NO_BROWSER', 'ERAGON_CREDENTIALS', 'DISPLAY', 'WAYLAND_DISPLAY', 'FIXTURE_REAL_SLEEP', 'FIXTURE_ERAGON']:
         environment.pop(name, None)
     if request.get('provideEndpoint', True):
         environment['ERAGON_ENDPOINT'] = 'https://gateway.example.com/gw'
+    # The eragon CLI's own credential file, which the router may only read.
+    cli_file = root / 'eragon-cli' / 'credentials.json'
+    if 'cliCredentials' in request:
+        cli_file.parent.mkdir(mode=0o700)
+        cli_file.write_text(json.dumps(request['cliCredentials'], indent=2) + '\n')
+        cli_file.chmod(0o600)
+        cli_bytes = cli_file.read_bytes()
+        environment['ERAGON_CREDENTIALS'] = str(cli_file)
     environment.update(request.get('environment', {}))
+    environment['FIXTURE_LOG'] = str(log)
+    environment['EXPECTED_ERAGON_URL'] = request.get('expectedEragonUrl', 'https://gateway.example.com')
+    if 'eragon' in request:
+        (log / 'eragon.json').write_text(json.dumps(request['eragon']))
+        environment['FIXTURE_ERAGON'] = str(log / 'eragon.json')
     environment['EXPECTED_ENDPOINT'] = request.get('expectedEndpoint', 'https://gateway.example.com/gw')
     environment['EXPECT_MEMORY_ON_PATH'] = '1' if request.get('expectMemoryOnPath') else '0'
     environment['CHECK_MEMORY_CHILD'] = '1' if request.get('checkMemoryChild') else '0'
@@ -236,11 +318,32 @@ if os.environ.get('CHECK_MEMORY_CHILD') == '1':
             if 'expectedSavedKeys' in request:
                 assert saved['keys'] == request['expectedSavedKeys']
             else:
-                assert all(value == 'fixture-secret' for value in saved['keys'].values())
+                assert all(value == KEY for value in saved['keys'].values())
             assert credential_file.stat().st_mode & 0o777 == 0o600
             assert credential_dir.stat().st_mode & 0o777 == 0o700
             result['savedEndpoints'] = sorted(saved['keys'])
             result['lastEndpoint'] = saved['last_endpoint']
+            if 'sign_ins' in saved:
+                result['signIns'] = saved['sign_ins']
+        # Every curl call is recorded: what was requested, and proof that no
+        # sign-in token or device code was ever a process argument.
+        calls_log = log / 'curl.jsonl'
+        calls = [json.loads(line) for line in calls_log.read_text().splitlines()] if calls_log.exists() else []
+        for call in calls:
+            assert all('ecli_' not in arg and 'edc_' not in arg for arg in call['argv']), call['argv']
+        result['requests'] = [('POST ' if call['post'] else 'GET ') + call['url'] for call in calls]
+        for name in ['sleeps', 'labels']:
+            result[name] = (log / name).read_text().splitlines() if (log / name).exists() else []
+        opened = log / 'opened'
+        if request.get('expectOpened'):
+            # The browser opener runs detached; give it a moment to record.
+            wait_until = time.monotonic() + 3
+            while not opened.exists() and time.monotonic() < wait_until: time.sleep(.05)
+        result['opened'] = opened.read_text().splitlines() if opened.exists() else []
+        assert all('ecli_' not in line and 'edc_' not in line for line in result['opened'])
+        if 'cliCredentials' in request:
+            result['cliUnchanged'] = (cli_file.read_bytes() == cli_bytes and
+                                      sorted(p.name for p in cli_file.parent.iterdir()) == ['credentials.json'])
         if request.get('relaunch'):
             again = subprocess.run(arguments, cwd=directory, env=environment,
                                    input='', capture_output=True, text=True, timeout=8)
@@ -253,9 +356,12 @@ if os.environ.get('CHECK_MEMORY_CHILD') == '1':
             result['memoryRegistration'] = json.loads(registration.read_text())
         return result
 
-    expected_files = ['claude', 'codex', 'curl', 'eragon.sh', 'pi', 'opencode', 'memory-bridge.py', 'bridge-installer.py', 'node', 'npm']
+    expected_files = ['claude', 'codex', 'curl', 'eragon.sh', 'pi', 'opencode', 'memory-bridge.py', 'bridge-installer.py', 'node', 'npm',
+                      'sleep', 'open', 'xdg-open', 'log']
     if request.get('expectStorage') or 'savedCredentials' in request or request.get('symlinkCredentials') or request.get('expectMemoryRegistration'):
         expected_files.append('config')
+    if 'cliCredentials' in request:
+        expected_files.append('eragon-cli')
     if request.get('expectMemoryData') or request.get('memoryCached'):
         expected_files.append('data')
     if 'manifest' in request:
@@ -286,6 +392,11 @@ if os.environ.get('CHECK_MEMORY_CHILD') == '1':
     memory_prompts_seen = 0
     key_actions = iter(request.get("keyActions", [""]))
     key_prompts_seen = 0
+    key_numbers = iter(request.get("keyNumbers", [""]))
+    key_number_prompts_seen = 0
+    pastes = iter(request.get("pastes", []))
+    paste_prompts_seen = 0
+    interrupted_waiting = False
     deadline = time.monotonic() + 8
     while time.monotonic() < deadline:
         ready, _, _ = select.select([fd], [], [], .1)
@@ -312,7 +423,21 @@ if os.environ.get('CHECK_MEMORY_CHILD') == '1':
         if client_count > client_prompts_seen:
             os.write(fd, (next(client_choices, '') + '\n').encode()); client_prompts_seen = client_count
         if b'Personal API Key: ' in transcript and not sent_key:
-            os.write(fd, b'\x03' if request.get('interrupt') else b'fixture-secret\n'); sent_key = True
+            os.write(fd, b'\x03' if request.get('interrupt') else (KEY + '\n').encode()); sent_key = True
+        number_count = transcript.count(b'Key number [')
+        if number_count > key_number_prompts_seen:
+            action = next(key_numbers, '')
+            os.write(fd, b'\x03' if action == 'INTERRUPT' else (action + '\n').encode())
+            key_number_prompts_seen = number_count
+        # The secret prompt disables echo before it is printed, so a paste
+        # written after it appears must not show up in the transcript.
+        paste_count = transcript.count(b'Paste the secret for ')
+        if paste_count > paste_prompts_seen:
+            value = next(pastes, 'q')
+            os.write(fd, b'\x03' if value == 'INTERRUPT' else (value + '\n').encode())
+            paste_prompts_seen = paste_count
+        if request.get('interruptWaiting') and not interrupted_waiting and b'Waiting' in transcript:
+            os.write(fd, b'\x03'); interrupted_waiting = True
         count = transcript.count(b'Model number [1]: ')
         if count > prompts_seen:
             os.write(fd, (next(choices, '') + '\n').encode()); prompts_seen = count

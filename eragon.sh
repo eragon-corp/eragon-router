@@ -9,7 +9,7 @@ set +a
 fail() { printf '%s\n' "$1" >&2; exit 1; }
 usage() {
   cat <<'HELP'
-Usage: eragon-router [--client claude|codex|pi|opencode] [--endpoint HTTPS_URL] [--model MODEL_ID] [--context-window TOKENS] [--search TEXT] [--memory] [--remember-key|--update-key|--forget-key]
+Usage: eragon-router [--client claude|codex|pi|opencode] [--endpoint HTTPS_URL] [--model MODEL_ID] [--context-window TOKENS] [--search TEXT] [--memory] [--remember-key|--update-key|--forget-key] [--login [--eragon-url HTTPS_URL] [--no-browser]|--logout]
 
   --client NAME   claude, codex, pi or opencode; skip the interactive client menu.
   --endpoint URL  Gateway base URL (non-Claude clients also accept a trailing /v1).
@@ -19,6 +19,11 @@ Usage: eragon-router [--client claude|codex|pi|opencode] [--endpoint HTTPS_URL] 
   --remember-key  Save this Gateway and key locally (owner-only plaintext file).
   --update-key    Prompt for a replacement key for this Gateway, save on launch.
   --forget-key    Delete all locally remembered Gateway credentials and exit.
+  --login         Sign in with your browser, then choose one of your own Gateway keys.
+  --eragon-url URL  Eragon address for sign-in (default: the Gateway URL without /gw).
+  --no-browser    Print the sign-in link and code instead of opening a browser.
+  --logout        Forget saved Eragon sign-ins on this machine and exit; with
+                  --endpoint or --eragon-url, only the sign-in for that Eragon.
   --context-window TOKENS  Actual gateway context/input limit (Claude: >=125000; Pi: >=32768; others: >=4096).
   -v, --version   Show the installed router version.
   -h, --help      Show this help.
@@ -26,41 +31,58 @@ Usage: eragon-router [--client claude|codex|pi|opencode] [--endpoint HTTPS_URL] 
 Standalone alternative: bash /path/to/eragon.sh [options]
 
 Environment: ERAGON_ENDPOINT, ERAGON_MODEL, ERAGON_API_KEY, ERAGON_CONTEXT_WINDOW, ERAGON_CLIENT.
+Sign-in: ERAGON_URL (Eragon address), ERAGON_NO_BROWSER=1. A sign-in made with the
+eragon CLI for the same Eragon is reused read-only (ERAGON_CREDENTIALS).
 Optional ERAGON_COMPATIBILITY_FILE: local verified-profile JSON (no keys/URLs).
 Flags override environment values and remembered credentials.
 Without an endpoint, prompt for a Gateway URL (Enter uses the last saved URL).
 Without a key, offer to use/update a matching saved key, or prompt with hidden input.
+An Eragon Gateway (URL ending in /gw) also offers to sign in and choose one of your keys.
 Local storage: ${XDG_CONFIG_HOME:-$HOME/.config}/eragon-router/credentials.json.
 Saving is opt-in; keys are plaintext with directory 700 / file 600 permissions.
+A sign-in is stored in the same file. --logout forgets it on this machine only;
+revoke it in the Eragon web app under Settings → Command line.
 Model menu: /text searches all usable models, / clears, m shows unverified.
 Pass keys through the environment or hidden prompt, never command arguments.
 HELP
 }
-unset endpoint selected eragon_key context_limit client saved_credentials credential_json
+# Unset every name that may hold a credential: a same-named variable inherited
+# from the environment would otherwise export it to child processes, including
+# through function locals.
+unset endpoint selected eragon_key context_limit client saved_credentials credential_json \
+  credential_secret saved_key eragon_url eragon_token stored_sign_in hidden_input \
+  start_request poll_request http_response http_body eragon_user eragon_email key_rows
 eragon_key=${ERAGON_API_KEY-}
 unset ERAGON_API_KEY ERAGON_ROUTER_TOKEN ERAGON_GATEWAY_URL
 endpoint=${ERAGON_ENDPOINT-}
 selected=${ERAGON_MODEL-}
 context_limit=${ERAGON_CONTEXT_WINDOW-}
 client=${ERAGON_CLIENT-}
+eragon_url_setting=${ERAGON_URL-}
 search_query=''; remember_key=0; forget_key=0; prompted_key=0; update_key=0; using_saved_key=0; memory_setup=ask
+sign_in=0; sign_out=0; no_browser=0; endpoint_flag=0; eragon_url_flag=0
+case "${ERAGON_NO_BROWSER-}" in ''|0) ;; *) no_browser=1 ;; esac
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --endpoint|--model|--context-window|--client|--search)
+    --endpoint|--model|--context-window|--client|--search|--eragon-url)
       [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || fail "Missing value for $1."
       case "$1" in
         --search) search_query=$2 ;;
         --client) client=$2 ;;
-        --endpoint) endpoint=$2 ;;
+        --endpoint) endpoint=$2; endpoint_flag=1 ;;
         --model) selected=$2 ;;
         --context-window) context_limit=$2 ;;
+        --eragon-url) eragon_url_setting=$2; eragon_url_flag=1 ;;
       esac
       shift 2 ;;
     --memory) memory_setup=on; shift ;;
     --remember-key) remember_key=1; shift ;;
     --update-key) update_key=1; remember_key=1; shift ;;
     --forget-key) forget_key=1; shift ;;
-    -v|--version) printf 'Eragon Router 0.1.0\n'; exit 0 ;;
+    --login) sign_in=1; shift ;;
+    --logout) sign_out=1; shift ;;
+    --no-browser) no_browser=1; shift ;;
+    -v|--version) printf 'Eragon Router 0.2.0\n'; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     *) fail 'Unknown option. Run eragon-router --help (or bash eragon.sh --help).' ;;
   esac
@@ -69,6 +91,69 @@ done
 credential_dir="${XDG_CONFIG_HOME:-$HOME/.config}/eragon-router"
 credential_file="$credential_dir/credentials.json"
 saved_credentials='{"last_endpoint":"","keys":{}}'
+# Gateway keys by Gateway URL, plus optional Eragon sign-ins by Eragon URL.
+# Releases before 0.2.0 check only last_endpoint and keys, so they still load it.
+credential_schema='
+  if length == 1 and (.[0] | type == "object") then .[0] else error("invalid") end |
+  if (.last_endpoint | type == "string") and (.keys | type == "object") and
+    all(.keys[]; type == "string" and length > 0 and (test("[\\r\\n]") | not)) and
+    ((.sign_ins // {}) | type == "object" and all(.[]; type == "object" and
+      (.token | type == "string" and length > 0 and (test("[\\r\\n]") | not))))
+  then . else error("invalid") end'
+# Replace the credential file atomically: private directory, a temporary file
+# beside it, then rename. jq reads the saved JSON as $saved[0] and the secret on
+# stdin, so no credential becomes a process argument.
+save_credentials() {
+  local credential_secret=$1 url=$2 filter=$3
+  (umask 077; mkdir -p -- "$credential_dir")
+  [[ -d "$credential_dir" && ! -L "$credential_dir" && -O "$credential_dir" ]] || fail 'Unsafe credential directory.'
+  chmod 700 "$credential_dir"
+  credential_tmp=$(mktemp "$credential_dir/.credentials.XXXXXXXX") || fail 'Could not create credential file.'
+  trap 'rm -f -- "$credential_tmp"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  if [[ -f "$credential_file" ]]; then
+    [[ ! -L "$credential_file" && -O "$credential_file" ]] || fail 'Unsafe credential file.'
+    credential_source=$credential_file
+  else
+    printf '{"last_endpoint":"","keys":{}}\n' > "$credential_tmp"
+    credential_source=$credential_tmp
+  fi
+  # Read the existing JSON before replacing the destination, including on first save.
+  credential_json=$(printf '%s' "$credential_secret" | jq -Rs --arg url "$url" \
+    --slurpfile saved "$credential_source" "$filter") || fail 'Could not update saved credentials.'
+  printf '%s\n' "$credential_json" > "$credential_tmp"
+  chmod 600 "$credential_tmp"
+  mv -f -- "$credential_tmp" "$credential_file"
+  trap - EXIT INT TERM
+  unset credential_json credential_source credential_tmp
+}
+# Reject credentials, queries, fragments, control characters and ambiguous URLs.
+https_base_url() {
+  printf '%s' "$1" | jq -eRs '
+    test("\\Ahttps://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/:-]*)?\\z")
+  ' >/dev/null
+}
+# The Eragon that signs you in: --eragon-url, else ERAGON_URL, else the Gateway
+# URL without a trailing /v1 and /gw. Sets eragon_url, or eragon_url_problem.
+resolve_eragon_url() {
+  local candidate=$1
+  eragon_url=''
+  if [[ -n "$eragon_url_setting" ]]; then
+    candidate=$eragon_url_setting
+    eragon_url_problem='Eragon URL must be an HTTPS base URL without credentials, query or fragment.'
+    https_base_url "$candidate" || return 0
+  else
+    eragon_url_problem='Cannot tell which Eragon serves this Gateway: its URL does not end in /gw. Use --eragon-url https://your-eragon.example.com (or set ERAGON_URL).'
+    while [[ "$candidate" == */ ]]; do candidate=${candidate%/}; done
+    candidate=${candidate%/v1}
+    [[ "$candidate" == */gw ]] || return 0
+    candidate=${candidate%/gw}
+  fi
+  while [[ "$candidate" == */ ]]; do candidate=${candidate%/}; done
+  https_base_url "$candidate" || return 0
+  eragon_url=$candidate
+}
 if [[ -e "$credential_dir" || -L "$credential_dir" ]]; then
   [[ -d "$credential_dir" && ! -L "$credential_dir" && -O "$credential_dir" ]] || fail 'Unsafe credential directory: must be owned by you and not a symlink.'
   chmod 700 "$credential_dir"
@@ -78,17 +163,54 @@ if [[ -e "$credential_file" || -L "$credential_file" ]]; then
   chmod 600 "$credential_file"
   if [[ "$forget_key" == 0 ]]; then
     command -v jq >/dev/null 2>&1 || fail 'Missing jq.'
-    saved_credentials=$(jq -ecs '
-      if length == 1 and (.[0] | type == "object") then .[0] else error("invalid") end |
-      if (.last_endpoint | type == "string") and (.keys | type == "object") and
-        all(.keys[]; type == "string" and length > 0 and (test("[\\r\\n]") | not))
-      then . else error("invalid") end' "$credential_file" 2>/dev/null) || fail 'Invalid saved credentials. Use --forget-key to remove them.'
+    saved_credentials=$(jq -ecs "$credential_schema" "$credential_file" 2>/dev/null) || fail 'Invalid saved credentials. Use --forget-key to remove them.'
+  elif command -v jq >/dev/null 2>&1; then
+    # --forget-key also clears a damaged file; a valid one keeps its sign-ins.
+    saved_credentials=$(jq -ecs "$credential_schema" "$credential_file" 2>/dev/null) ||
+      saved_credentials='{"last_endpoint":"","keys":{}}'
   fi
 fi
-if [[ "$forget_key" == 1 ]]; then
-  rm -f -- "$credential_file"
-  printf 'Remembered Gateway credentials removed.\n'
+revoke_hint='This machine stays listed in Eragon until you revoke it in the web app under Settings → Command line.'
+if [[ "$sign_out" == 1 && "$forget_key" == 0 ]]; then
+  # Local only: saved Gateway keys and the eragon CLI's own file are left alone.
+  command -v jq >/dev/null 2>&1 || fail 'Missing jq.'
+  logout_url=''
+  if [[ "$endpoint_flag" == 1 || -n "$eragon_url_setting" ]]; then
+    if [[ -z "$eragon_url_setting" ]]; then
+      https_base_url "$endpoint" || fail 'Endpoint must be an HTTPS base URL without credentials, query or fragment.'
+    fi
+    resolve_eragon_url "$endpoint"
+    [[ -n "$eragon_url" ]] || fail "$eragon_url_problem"
+    logout_url=$eragon_url
+  fi
+  forgotten=$(printf '%s' "$saved_credentials" | jq -r --arg url "$logout_url" '
+    (.sign_ins // {}) | keys[] | select($url == "" or . == $url) |
+    explode | map(select(. >= 32 and . != 127)) | implode')
+  if [[ -z "$forgotten" ]]; then
+    printf 'No Eragon sign-in is saved%s.\n' "${logout_url:+ for $logout_url}"
+  else
+    save_credentials '' "$logout_url" '$saved[0] |
+      .sign_ins = ((.sign_ins // {}) | if $url == "" then {} else del(.[$url]) end) |
+      if .sign_ins == {} then del(.sign_ins) else . end'
+    while IFS= read -r line; do printf 'Forgot the Eragon sign-in for %s.\n' "$line"; done <<< "$forgotten"
+  fi
+  printf '%s\n' "$revoke_hint"
   exit 0
+fi
+if [[ "$forget_key" == 1 ]]; then
+  # Gateway keys only: a valid file keeps its Eragon sign-ins unless --logout is also given.
+  if [[ "$sign_out" == 0 ]] && printf '%s' "$saved_credentials" | jq -e '(.sign_ins // {}) | length > 0' >/dev/null 2>&1; then
+    save_credentials '' '' '$saved[0] | {last_endpoint: "", keys: {}, sign_ins}'
+    printf 'Remembered Gateway credentials removed. Eragon sign-ins were kept; use --logout to forget them.\n'
+  else
+    rm -f -- "$credential_file"
+    printf 'Remembered Gateway credentials removed.\n'
+    if [[ "$sign_out" == 1 ]]; then printf 'Eragon sign-ins removed too. %s\n' "$revoke_hint"; fi
+  fi
+  exit 0
+fi
+if [[ "$sign_in" == 1 ]]; then
+  [[ -t 0 && -t 1 ]] || fail 'Signing in needs an interactive terminal.'
 fi
 if [[ -z "$endpoint" ]]; then
   [[ -t 0 && -t 1 ]] || fail 'Endpoint required. Use --endpoint or ERAGON_ENDPOINT.'
@@ -136,19 +258,25 @@ esac
 for dependency in "$client_command" jq; do
   command -v "$dependency" >/dev/null 2>&1 || fail "Missing $dependency. Install it, then run this script again."
 done
-# Reject credentials, queries, fragments, control characters and ambiguous URLs.
 # Validate before showing the endpoint or sending any credential.
-printf '%s' "$endpoint" | jq -eRs '
-  test("\\Ahttps://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~%/:-]*)?\\z")
-' >/dev/null || fail 'Endpoint must be an HTTPS base URL without credentials, query or fragment.'
+https_base_url "$endpoint" || fail 'Endpoint must be an HTTPS base URL without credentials, query or fragment.'
 while [[ "$endpoint" == */ ]]; do endpoint=${endpoint%/}; done
 if [[ "$client" != claude && "$endpoint" == */v1 ]]; then endpoint=${endpoint%/v1}; fi
 # /v1 is a protocol suffix, not a different credential scope.
 credential_endpoint=${endpoint%/v1}
-if [[ -z "$eragon_key" && "$update_key" == 0 ]]; then
-  eragon_key=$(printf '%s' "$saved_credentials" | jq -r --arg url "$credential_endpoint" '.keys[$url] // ""')
-  if [[ -n "$eragon_key" ]]; then using_saved_key=1; fi
+# Sign-in is offered only when the Eragon behind this Gateway is known; any
+# other Gateway keeps the key prompts exactly as they were.
+resolve_eragon_url "$endpoint"
+if [[ -z "$eragon_url" && ( "$sign_in" == 1 || "$eragon_url_flag" == 1 ) ]]; then fail "$eragon_url_problem"; fi
+saved_key=$(printf '%s' "$saved_credentials" | jq -r --arg url "$credential_endpoint" '.keys[$url] // ""')
+if [[ "$sign_in" == 1 ]]; then
+  # Like --update-key, --login replaces an environment or saved key for this launch.
+  eragon_key=''
+elif [[ -z "$eragon_key" && "$update_key" == 0 && -n "$saved_key" ]]; then
+  eragon_key=$saved_key; using_saved_key=1
 fi
+stored_sign_in=$(printf '%s' "$saved_credentials" | jq -r --arg url "$eragon_url" '
+  (.sign_ins // {}) | .[$url].token // "" | if test("\\Aecli_[A-Za-z0-9_-]+\\z") then . else "" end')
 unset saved_credentials
 if [[ -n "$selected" ]]; then
   printf '%s' "$selected" | jq -eRs '
@@ -175,33 +303,346 @@ printf '%s' "$client_version" | jq -eRs --argjson minimum "$minimum_version" '
   capture("\\A(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)\\z") |
   [.major,.minor,.patch] | map(tonumber) | . >= $minimum
 ' >/dev/null || fail "Update $client_label to its supported baseline or later: Claude Code 2.1.302 (claude update), Codex 0.160.0, Pi 0.73.1, OpenCode 1.3.7."
+
+# Hidden input: disable echo before printing the prompt, including an immediate
+# paste, and restore the terminal on every exit, including Ctrl-C.
+read_hidden() {
+  command -v stty >/dev/null 2>&1 || fail 'Missing stty.'
+  terminal_mode=$(stty -g)
+  trap 'stty "$terminal_mode"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  stty -echo
+  read -r -p "$1" hidden_input
+  stty "$terminal_mode"
+  trap - EXIT INT TERM
+  unset terminal_mode
+  printf '\n'
+}
+
+# Optional sign-in through Eragon's device authorization, the flow behind
+# `eragon login`: a browser that is already signed in approves this machine.
+# The resulting ecli_ token is a personal credential. It reaches curl only on
+# stdin, is never exported or printed, and is stored only in the credential
+# file above. Gateway keys are listed here, never created.
+jq_clean='def clean: tostring | explode | map(select((. >= 32 and . < 127) or
+  (. >= 160 and . != 173 and (. < 8203 or . > 8207) and (. < 8232 or . > 8238) and
+   (. < 8288 or . > 8303) and . != 65279))) | implode;'
+# GET sends the token as a header on stdin; POST sends its JSON body on stdin.
+# HTTPS only, no .curlrc, no redirects. The HTTP status follows the body.
+eragon_get() {
+  printf 'Authorization: Bearer %s\n' "$eragon_token" |
+    curl -q --silent --show-error --proto '=https' --connect-timeout 10 --max-time 30 \
+      --header @- --header 'Accept: application/json' --write-out '\n%{http_code}' \
+      --url "$eragon_url$1"
+}
+eragon_post() {
+  curl -q --silent --show-error --proto '=https' --connect-timeout 10 --max-time 30 \
+    --header 'Accept: application/json' --header 'Content-Type: application/json' \
+    --data-binary @- --write-out '\n%{http_code}' --url "$eragon_url$1"
+}
+split_response() {
+  http_status=${http_response##*$'\n'}
+  http_body=${http_response%$'\n'*}
+  case "$http_status" in [1-5][0-9][0-9]) ;; *) http_status=000 ;; esac
+}
+# A string or number field of the last answer. Server text is untrusted, so
+# control and escape characters are removed before anything is printed.
+answer_text() {
+  printf '%s' "$http_body" | jq -r --arg field "$1" "$jq_clean"'
+    if type == "object" and (.[$field] | type) == "string" then .[$field] | clean else "" end' 2>/dev/null || true
+}
+answer_number() {
+  printf '%s' "$http_body" | jq -r --arg field "$1" --argjson low "$2" --argjson high "$3" '
+    if type == "object" and (.[$field] | type) == "number" and .[$field] >= $low and .[$field] <= $high
+    then .[$field] | floor else empty end' 2>/dev/null || true
+}
+# Ask Eragon whose sign-in this is. 401 means revoked or no longer allowed by the
+# login policy; any other failure, including a network error, stops the launch.
+check_sign_in() {
+  sign_in_state=rejected
+  http_response=$(eragon_get /v1/me) || fail "Could not reach $eragon_url. Check your network, then retry."
+  split_response
+  [[ "$http_status" != 401 ]] || return 0
+  [[ "$http_status" == 200 ]] || fail "Could not confirm your Eragon sign-in at $eragon_url (HTTP $http_status). Nothing was saved; retry later."
+  eragon_user=$(answer_text userId)
+  eragon_email=$(answer_text email)
+  [[ -n "$eragon_user" ]] || fail "Unexpected answer from $eragon_url when confirming your sign-in."
+  sign_in_state=valid
+}
+# A sign-in made with the eragon CLI for the same Eragon. That file belongs to
+# the eragon CLI: it is read here, never written or locked.
+eragon_cli_token() {
+  local file=${ERAGON_CREDENTIALS:-${XDG_CONFIG_HOME:-$HOME/.config}/eragon/credentials.json}
+  [[ -f "$file" && -r "$file" && -O "$file" ]] || return 0
+  jq -r --arg url "$eragon_url" '[.credentials[]? | select(type == "object" and .url == $url) |
+    .token | select(type == "string" and test("\\Aecli_[A-Za-z0-9_-]+\\z"))] | .[0] // ""' "$file" 2>/dev/null || true
+}
+eragon_device_sign_in() {
+  local label host poll_status poll_interval poll_expires poll_waited poll_started user_code verification_url browser
+  host=${HOSTNAME:-localhost}
+  label="eragon-router (${USER:-$(id -un 2>/dev/null || true)}@${host%%.*})"
+  start_request=$(jq -cn --arg label "$label" \
+    '{label: ($label | explode | map(select(. >= 32 and . < 127)) | implode | .[:120])}')
+  label=$(printf '%s' "$start_request" | jq -r '.label')
+  http_response=$(printf '%s' "$start_request" | eragon_post /v1/auth/device/start) ||
+    fail "Could not reach $eragon_url. Check the Eragon URL and your network, then retry."
+  split_response
+  [[ "$http_status" != 429 ]] || fail 'Too many sign-ins are waiting for approval from this network. Wait a few minutes, then retry.'
+  [[ "$http_status" == 200 ]] || fail "Could not start signing in at $eragon_url (HTTP $http_status)."
+  poll_request=$(printf '%s' "$http_body" | jq -c 'select(type == "object" and
+    (.deviceCode | type) == "string" and (.deviceCode | length) > 0) | {deviceCode}' 2>/dev/null) || poll_request=''
+  user_code=$(answer_text userCode)
+  verification_url=$(answer_text verificationUriComplete)
+  poll_interval=$(answer_number interval 1 600)
+  poll_expires=$(answer_number expiresIn 1 86400)
+  [[ -n "$poll_request" && -n "$user_code" && -n "$verification_url" ]] ||
+    fail "Unexpected answer from $eragon_url when starting sign-in."
+  # Ctrl-C while waiting stores nothing; the terminal is never changed here.
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  printf 'Open  %s\nCode  %s\n\nApprove "%s" in your browser. Waiting… (Ctrl-C to cancel)\n' \
+    "$verification_url" "$user_code" "$label" >&2
+  if [[ "$no_browser" == 0 && "$verification_url" == https://* ]]; then
+    browser=''
+    case "$(uname -s 2>/dev/null || true)" in
+      Darwin) browser=open ;;
+      *) if [[ -n "${DISPLAY-}" || -n "${WAYLAND_DISPLAY-}" ]]; then browser=xdg-open; fi ;;
+    esac
+    # Best effort, detached and silenced: the printed link is enough.
+    if [[ -n "$browser" ]] && command -v "$browser" >/dev/null 2>&1; then
+      ("$browser" "$verification_url" </dev/null >/dev/null 2>&1 &)
+    fi
+  fi
+  poll_interval=${poll_interval:-5}; poll_expires=${poll_expires:-900}
+  poll_waited=0; poll_started=$SECONDS
+  while true; do
+    sleep "$poll_interval"
+    poll_waited=$((poll_waited + poll_interval))
+    if [[ "$poll_waited" -ge "$poll_expires" || $((SECONDS - poll_started)) -ge "$poll_expires" ]]; then
+      fail 'The code expired before it was approved. Run with --login again.'
+    fi
+    http_response=$(printf '%s' "$poll_request" | eragon_post /v1/auth/device/token) ||
+      fail "Could not reach $eragon_url while waiting for approval. Run with --login again."
+    split_response
+    poll_status=''
+    if [[ "$http_status" == 200 ]]; then poll_status=$(answer_text status); fi
+    case "$poll_status" in
+      pending) ;;
+      slow_down) poll_interval=$((poll_interval + 5)) ;;
+      issued) break ;;
+      denied) fail 'Declined in the browser. Nothing was stored.' ;;
+      expired|unknown) fail 'The code expired before it was approved. Run with --login again.' ;;
+      *) fail "Unexpected answer from $eragon_url while waiting for approval (HTTP $http_status)." ;;
+    esac
+  done
+  trap - INT TERM
+  eragon_token=$(printf '%s' "$http_body" | jq -r 'if (.token | type) == "string" and
+    (.token | test("\\Aecli_[A-Za-z0-9_-]+\\z")) then .token else "" end' 2>/dev/null) || eragon_token=''
+  unset start_request poll_request http_response http_body
+  [[ -n "$eragon_token" ]] || fail "Unexpected answer from $eragon_url while waiting for approval."
+  # The new sign-in proves itself before anything is written.
+  check_sign_in
+  [[ "$sign_in_state" == valid ]] || fail 'Approved, but Eragon did not accept the new sign-in. Nothing was stored.'
+  printf 'Signed in to %s%s.\n' "$eragon_url" "${eragon_email:+ as $eragon_email}" >&2
+  save_credentials "$eragon_token"$'\n'"$eragon_email" "$eragon_url" '
+    split("\n") as [$token, $email] | $saved[0] |
+    .sign_ins = ((.sign_ins // {}) + {($url): ({token: $token, createdAt: (now | todate)} +
+      (if ($email // "") == "" then {} else {email: $email} end))})'
+}
+# Reuse the router's sign-in, then the eragon CLI's, before asking the browser.
+eragon_sign_in() {
+  command -v curl >/dev/null 2>&1 || fail 'Missing curl. Install it, then run this script again.'
+  if [[ -n "$stored_sign_in" ]]; then
+    eragon_token=$stored_sign_in
+    check_sign_in
+    if [[ "$sign_in_state" == valid ]]; then
+      printf 'Using your saved sign-in to %s%s.\n' "$eragon_url" "${eragon_email:+ as $eragon_email}" >&2
+      return 0
+    fi
+    # Revoked or no longer allowed: forget only the router's own copy.
+    save_credentials '' "$eragon_url" '$saved[0] | .sign_ins = ((.sign_ins // {}) | del(.[$url])) |
+      if .sign_ins == {} then del(.sign_ins) else . end'
+    printf 'Your saved sign-in to %s is no longer accepted.\n' "$eragon_url" >&2
+  fi
+  eragon_token=$(eragon_cli_token)
+  if [[ -n "$eragon_token" ]]; then
+    check_sign_in
+    if [[ "$sign_in_state" == valid ]]; then
+      printf 'Using your eragon CLI sign-in to %s%s.\n' "$eragon_url" "${eragon_email:+ as $eragon_email}" >&2
+      return 0
+    fi
+    printf 'Your eragon CLI sign-in to %s is no longer accepted.\n' "$eragon_url" >&2
+  fi
+  eragon_device_sign_in
+}
+# Your own active Gateway keys: created by you, not provisioned by a partner.
+# A key whose last four characters match the key saved for this Gateway uses
+# that saved secret; any other key asks for its secret with hidden input.
+eragon_choose_key() {
+  local saved_last4='' saved_index='' hidden_keys hidden_note='' chosen_key='' index key_line key_choice
+  local default_key paste_prompt row_last4 row_unique row_name row_details
+  http_response=$(eragon_get /v1/gateway-keys) || fail "Could not reach $eragon_url. Check your network, then retry."
+  split_response
+  [[ "$http_status" == 200 ]] || fail "Could not load your Gateway keys from $eragon_url (HTTP $http_status)."
+  key_rows=$(printf '%s' "$http_body" | jq -r --arg me "$eragon_user" "$jq_clean"'
+    def cut($width): if length > $width then .[:$width - 1] + "…" else . end;
+    def money: (if . < 0 then 0 else . end) * 100 + 0.5 | floor | "$" + (. / 100 | floor | tostring) +
+      (if . % 100 == 0 then "" else "." + (. % 100 | tostring | if length == 1 then "0" + . else . end) end);
+    def count($word): "\(.) \($word)" + (if . == 1 then "" else "s" end);
+    def state: if (.status | type) == "string" then .status
+      elif .revokedAt != null then "revoked"
+      elif (.expiresAt | type) == "string" and .expiresAt <= (now | todate) then "expired"
+      else "active" end;
+    def suffix: .secretLast4 | if type == "string" and test("\\A[!-~]{4}\\z") then . else "-" end;
+    if type != "array" then error("not a key list") else . end |
+    [.[] | select(type == "object" and .createdBy == $me and .provisionedBy == null)] as $mine |
+    [$mine[] | select(state == "active")] as $usable |
+    [$mine[] | suffix] as $suffixes |
+    "\(($mine | length) - ($usable | length))",
+    ($usable | sort_by(.name | if type == "string" then ascii_downcase else "" end) | .[] |
+      suffix as $last4 |
+      (if .allModels == true then "all models"
+       elif (.allowedPublicModelCount | type) == "number" then (.allowedPublicModelCount | floor | count("model"))
+       else null end) as $models |
+      (.allowedSmartRoutingGroups | if type == "array" then length else 0 end) as $groups |
+      (if $groups == 0 then $models elif $models == null then ($groups | count("routing group"))
+       else $models + " +" + ($groups | count("routing group")) end) as $access |
+      (.budget | if type == "object" then . else {} end) as $budget |
+      ($budget.renewal | if . == "1d" or . == "7d" or . == "30d" then " / " + . else "" end) as $window |
+      (if (.spendUsd | type) != "number" then null
+       elif ($budget.maxBudgetUsd | type) == "number" then
+         "\(.spendUsd | money) of \($budget.maxBudgetUsd | money)\($window)"
+       else "\(.spendUsd | money) spent\($window)" end) as $spend |
+      (if (.lastUsedAt | type) == "string" and (.lastUsedAt | test("\\A[0-9]{4}-[0-9]{2}-[0-9]{2}"))
+       then "last used " + .lastUsedAt[:10]
+       elif has("lastUsedAt") and .lastUsedAt == null then "never used" else null end) as $used |
+      [$last4,
+       (if $last4 != "-" and ([$suffixes[] | select(. == $last4)] | length) == 1 then "1" else "0" end),
+       (.name | if type == "string" then clean else "" end | if . == "" then "(unnamed key)" else cut(44) end),
+       ([$access, $spend, $used] | map(select(. != null)) | join(" · ") | clean | cut(74))] | join("\t"))
+  ' 2>/dev/null) || fail "Could not read your Gateway keys from $eragon_url."
+  unset http_response http_body
+  # "Saved here": the key saved for this Gateway ends with exactly one listed
+  # key's last four characters. Two of your keys sharing them claim neither.
+  if [[ "$saved_key" == esk_* && "${#saved_key}" -ge 8 ]]; then saved_last4=${saved_key:$((${#saved_key} - 4))}; fi
+  key_last4s=(); key_names=(); key_details=()
+  {
+    read -r hidden_keys
+    while IFS=$'\t' read -r row_last4 row_unique row_name row_details; do
+      key_last4s+=("$row_last4"); key_names+=("$row_name"); key_details+=("$row_details")
+      if [[ -n "$saved_last4" && "$row_unique" == 1 && "$row_last4" == "$saved_last4" ]]; then
+        saved_index=$((${#key_names[@]} - 1))
+      fi
+    done
+  } <<< "$key_rows"
+  unset key_rows
+  if [[ "${hidden_keys:-0}" == 1 ]]; then hidden_note='1 expired or revoked key hidden.'
+  elif [[ "${hidden_keys:-0}" != 0 ]]; then hidden_note="$hidden_keys expired or revoked keys hidden."; fi
+  if [[ "${#key_names[@]}" == 0 ]]; then
+    printf '\nYou have no active Gateway keys. Create one at %s/ai-gateway/keys, then run again.\n' "$eragon_url"
+    if [[ -n "$hidden_note" ]]; then printf '%s\n' "$hidden_note"; fi
+    printf '  1) Paste a key\n  q) Quit\n'
+    while true; do
+      read -r -p 'Key action [1]: ' key_choice || fail 'Key selection cancelled.'
+      case "${key_choice:-1}" in
+        1) return 0 ;;
+        q|Q) exit 1 ;;
+        *) printf 'Enter 1 or q.\n' ;;
+      esac
+    done
+  fi
+  printf '\nChoose one of your Gateway keys:\n'
+  for ((index=0; index<${#key_names[@]}; index++)); do
+    key_line="  $((index + 1))) ${key_names[index]}"
+    if [[ "${key_last4s[index]}" != - ]]; then key_line="$key_line …${key_last4s[index]}"; fi
+    if [[ "$index" == "$saved_index" ]]; then key_line="$key_line · saved here"; fi
+    printf '%s\n' "$key_line"
+    if [[ -n "${key_details[index]}" ]]; then printf '     %s\n' "${key_details[index]}"; fi
+  done
+  printf '  q) Quit\n'
+  if [[ -n "$hidden_note" ]]; then printf '%s\n' "$hidden_note"; fi
+  default_key=1
+  if [[ -n "$saved_index" ]]; then default_key=$((saved_index + 1)); fi
+  while true; do
+    read -r -p "Key number [$default_key]: " key_choice || fail 'Key selection cancelled.'
+    key_choice=${key_choice:-$default_key}
+    case "$key_choice" in q|Q) exit 0 ;; esac
+    for ((index=0; index<${#key_names[@]}; index++)); do
+      if [[ "$key_choice" == "$((index + 1))" ]]; then chosen_key=$index; fi
+    done
+    if [[ -n "$chosen_key" ]]; then break; fi
+    printf 'Enter one of the key numbers above, or q.\n'
+  done
+  if [[ "$chosen_key" == "$saved_index" ]]; then
+    eragon_key=$saved_key
+    printf 'Using the key saved here for %s.\n' "${key_names[chosen_key]}"
+    return 0
+  fi
+  paste_prompt="Paste the secret for ${key_names[chosen_key]}: "
+  if [[ "${key_last4s[chosen_key]}" != - ]]; then
+    paste_prompt="Paste the secret for ${key_names[chosen_key]} (…${key_last4s[chosen_key]}): "
+  fi
+  while true; do
+    read_hidden "$paste_prompt"
+    case "$hidden_input" in q|Q) exit 0 ;; esac
+    if [[ -n "$hidden_input" ]] && [[ "${key_last4s[chosen_key]}" == - || "$hidden_input" == *"${key_last4s[chosen_key]}" ]]; then
+      break
+    fi
+    if [[ -z "$hidden_input" ]]; then
+      printf 'Paste the key, or enter q to quit.\n'
+    else
+      printf 'That key does not end with …%s. Paste the matching key, or enter q to quit.\n' "${key_last4s[chosen_key]}"
+    fi
+  done
+  eragon_key=$hidden_input
+  unset hidden_input
+  prompted_key=1
+}
+
 printf 'Eragon Router · %s\nEndpoint: %s\n\n' "$client_label" "$endpoint"
+# Enter keeps the existing default: use the saved key, or paste a key.
+eragon_choice=$sign_in
 if [[ "$using_saved_key" == 1 && -t 0 && -t 1 ]]; then
-  printf 'API key saved for this Gateway:\n  1) Use saved key\n  2) Update saved key\n  q) Quit\n'
+  if [[ -n "$eragon_url" ]]; then
+    printf 'API key saved for this Gateway:\n  1) Use saved key\n  2) Update saved key\n  3) Choose from your Eragon keys (sign in with your browser)\n  q) Quit\n'
+  else
+    printf 'API key saved for this Gateway:\n  1) Use saved key\n  2) Update saved key\n  q) Quit\n'
+  fi
   while true; do
     read -r -p 'Key action [1]: ' key_action || fail 'Key selection cancelled.'
     case "${key_action:-1}" in
       1) break ;;
       2) eragon_key=''; remember_key=1; break ;;
       q|Q) exit 0 ;;
+    esac
+    if [[ "$key_action" == 3 && -n "$eragon_url" ]]; then eragon_key=''; eragon_choice=1; break; fi
+    if [[ -n "$eragon_url" ]]; then printf 'Enter 1, 2, 3 or q.\n'; else printf 'Enter 1, 2 or q.\n'; fi
+  done
+fi
+if [[ -z "$eragon_key" && "$eragon_choice" == 0 && -n "$eragon_url" && "$using_saved_key" == 0 &&
+      "$update_key" == 0 && -t 0 && -t 1 ]]; then
+  printf 'API key for this Gateway:\n  1) Paste a key\n  2) Choose from your Eragon keys (sign in with your browser)\n  q) Quit\n'
+  while true; do
+    read -r -p 'Key action [1]: ' key_action || fail 'Key selection cancelled.'
+    case "${key_action:-1}" in
+      1) break ;;
+      2) eragon_choice=1; break ;;
+      q|Q) exit 0 ;;
       *) printf 'Enter 1, 2 or q.\n' ;;
     esac
   done
 fi
+if [[ "$eragon_choice" == 1 ]]; then
+  eragon_sign_in
+  eragon_choose_key
+fi
+unset eragon_token stored_sign_in saved_key eragon_user eragon_email
 if [[ -z "$eragon_key" ]]; then
   [[ -t 0 && -t 1 ]] || fail 'Set ERAGON_API_KEY or run in an interactive terminal to enter a key.'
-  command -v stty >/dev/null 2>&1 || fail 'Missing stty.'
-  # Disable echo before printing the prompt, including an immediate paste.
-  terminal_mode=$(stty -g)
-  trap 'stty "$terminal_mode"' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  stty -echo
-  read -r -p 'Personal API Key: ' eragon_key
-  stty "$terminal_mode"
-  trap - EXIT INT TERM
-  unset terminal_mode
-  printf '\n'
+  read_hidden 'Personal API Key: '
+  eragon_key=$hidden_input
+  unset hidden_input
   prompted_key=1
 fi
 [[ -n "$eragon_key" ]] || fail 'An API key is required.'
@@ -436,29 +877,8 @@ fi
 if [[ "$remember_key" == 1 ]]; then
   # Use a private directory and atomic replacement; feed the key over stdin.
   # Never place it in jq arguments or an exported shell variable.
-  (umask 077; mkdir -p -- "$credential_dir")
-  [[ -d "$credential_dir" && ! -L "$credential_dir" && -O "$credential_dir" ]] || fail 'Unsafe credential directory.'
-  chmod 700 "$credential_dir"
-  credential_tmp=$(mktemp "$credential_dir/.credentials.XXXXXXXX") || fail 'Could not create credential file.'
-  trap 'rm -f -- "$credential_tmp"' EXIT
-  trap 'exit 130' INT
-  trap 'exit 143' TERM
-  if [[ -f "$credential_file" ]]; then
-    [[ ! -L "$credential_file" && -O "$credential_file" ]] || fail 'Unsafe credential file.'
-    credential_source=$credential_file
-  else
-    printf '{"last_endpoint":"","keys":{}}\n' > "$credential_tmp"
-    credential_source=$credential_tmp
-  fi
-  # Read the existing JSON before replacing the destination, including on first save.
-  credential_json=$(printf '%s' "$eragon_key" | jq -Rs --arg url "$credential_endpoint" \
-    --slurpfile saved "$credential_source" '. as $key | $saved[0] | .last_endpoint=$url | .keys[$url]=$key')
-  printf '%s\n' "$credential_json" > "$credential_tmp"
-  chmod 600 "$credential_tmp"
-  mv -f -- "$credential_tmp" "$credential_file"
-  trap - EXIT INT TERM
-  unset credential_json credential_source credential_tmp
-  printf 'Gateway and key remembered locally. Use --forget-key to remove all saved credentials.\n'
+  save_credentials "$eragon_key" "$credential_endpoint" '. as $key | $saved[0] | .last_endpoint=$url | .keys[$url]=$key'
+  printf 'Gateway and key remembered locally. Use --forget-key to remove saved keys.\n'
 fi
 
 # Keep a previously installed bridge reachable even when setup is skipped.
