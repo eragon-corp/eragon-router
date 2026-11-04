@@ -50,7 +50,7 @@ The launcher guides you through these steps:
 
 1. **Enter your Gateway URL.** Use the HTTPS base URL supplied by your administrator. No Gateway address is built in.
 2. **Choose a client.** Select Claude Code, Codex, Pi Agent, or OpenCode.
-3. **Enter your API key.** Input is hidden, so nothing appears as you type or paste.
+3. **Enter your API key.** Input is hidden, so nothing appears as you type or paste. With an Eragon Gateway, you can instead [sign in with your browser](#sign-in-to-choose-a-key) and choose one of your keys.
 4. **Choose a model.** Enter a number, or type `/keyword` to search.
 5. **Choose whether to remember your key.** Enter `y` to save it locally, or press Enter to use it for this run only.
 6. **Set up Eragon Memory (optional).** Choose `2` to automatically install the Memory bridge and connect it to this client, or press Enter to skip setup.
@@ -71,11 +71,12 @@ If you remembered credentials, press Enter at the Gateway prompt to reuse the sa
 API key saved for this Gateway:
   1) Use saved key
   2) Update saved key
+  3) Choose from your Eragon keys (sign in with your browser)
   q) Quit
 Key action [1]:
 ```
 
-Press Enter to continue with the saved key. Choose `2` to enter a replacement. Updates apply only to the selected Gateway; other saved Gateways keep their own keys. Cancelling or failing to load the model list preserves the old key.
+Press Enter to continue with the saved key. Choose `2` to enter a replacement. Updates apply only to the selected Gateway; other saved Gateways keep their own keys. Cancelling or failing to load the model list preserves the old key. Option `3` appears only for an Eragon Gateway; see [Sign in to choose a key](#sign-in-to-choose-a-key).
 
 To use a different Gateway, enter its URL at the first prompt. A key saved for another Gateway is not automatically reused.
 
@@ -117,7 +118,54 @@ To remove **all** remembered Gateway credentials:
 eragon-router --forget-key
 ```
 
+This keeps any stored Eragon sign-in; use `--logout` to forget that.
+
 Keys are not displayed or placed in command arguments. Do not paste a key into a terminal command, commit it to a repository, or include it in a support request.
+
+## Sign in to choose a key
+
+If your Gateway belongs to Eragon (its URL ends in `/gw`), you can sign in with a browser where you already use Eragon, then choose one of your own Gateway keys:
+
+```bash
+eragon-router --login
+```
+
+You can also pick **Choose from your Eragon keys (sign in with your browser)** in the key menu. Pressing Enter there still uses your saved key, or asks you to paste one, as before.
+
+1. **Approve this machine.** The launcher prints a link and a code, and opens the link in your browser:
+
+   ```text
+   Open  https://your-eragon.example.com/cli?code=ABCD-EFGH
+   Code  ABCD-EFGH
+
+   Approve "eragon-router (you@your-laptop)" in your browser. Waiting… (Ctrl-C to cancel)
+   ```
+
+   Check that the code matches, then approve. If the browser is not signed in to Eragon, the web app asks you to sign in first. The code expires after about 15 minutes. This is the same approval as `eragon login`; the launcher never reads your browser's cookies.
+2. **Choose a key.** The launcher lists the Gateway keys you created that are still active. Each entry shows the key's name, the last four characters of its secret, its model access, spend and budget, and when it was last used. Keys created by other people, keys provisioned by a partner, and expired or revoked keys are not listed; the launcher prints how many of your own keys it hid.
+3. **Provide the secret.** A key marked **saved here** uses the key this launcher already saved for this Gateway. For any other key, paste its secret when asked. Input is hidden, and the launcher refuses a secret that does not end with the four characters shown. Eragon's key list never includes secrets, so use the secret you kept when you created the key.
+
+The model menu and the remember prompt then work as usual. The launcher never creates Gateway keys. If you have none, create one in the web app at `https://your-eragon.example.com/ai-gateway/keys` (your own Eragon address), then run the launcher again, or paste a key instead.
+
+On a remote or headless machine, add `--no-browser` (or set `ERAGON_NO_BROWSER=1`) and open the printed link on any device where you can sign in to Eragon.
+
+The launcher finds your Eragon address by removing `/gw` from the Gateway URL. If your Gateway URL does not end in `/gw`, pass the address with `--eragon-url https://your-eragon.example.com`, or set `ERAGON_URL`.
+
+### What the sign-in stores
+
+After you approve, the launcher stores an Eragon CLI credential for that Eragon address, with your email address and the time you signed in. It goes into the same local file as saved keys, `~/.config/eragon-router/credentials.json`. Like saved keys, it is **plaintext**, protected only by owner-only permissions (`600` for the file, `700` for its directory). It is not encrypted.
+
+This credential acts as you. It can do what you can do through the Eragon web API, apart from a few actions Eragon reserves for the browser, such as approving devices and creating Gateway keys. The launcher uses it only to read your profile and list your keys, but anyone who can read the file could use it for more. Treat the file like a password. The credential is never placed in command arguments or passed to the client you launch.
+
+Next time, the launcher reuses the stored sign-in while Eragon still accepts it, and starts a new sign-in when it does not. If you already signed in to the same Eragon with the `eragon` command-line tool, the launcher can reuse that sign-in too. It reads that tool's file and never changes it.
+
+To forget the stored sign-ins on this machine:
+
+```bash
+eragon-router --logout
+```
+
+`--logout` forgets every stored sign-in, or only one with `--eragon-url` or `--endpoint`. It deletes the local copy only: the machine stays listed in Eragon, and the credential remains valid, until you revoke it in the web app under **Settings → Command line**. Saved Gateway keys and the `eragon` tool's own sign-in are left alone. `--forget-key` still removes saved Gateway keys only.
 
 ## Connect Eragon Memory
 
@@ -176,7 +224,7 @@ Replace `example/coder` with your actual model ID. This skips the model list and
 
 Use `--endpoint URL` to skip the Gateway prompt. Supply the HTTPS base URL without `/v1`; Codex, Pi, and OpenCode also accept a trailing `/v1`.
 
-For scripts and secret-manager integrations, the launcher accepts `ERAGON_CLIENT`, `ERAGON_ENDPOINT`, `ERAGON_MODEL`, `ERAGON_API_KEY`, and `ERAGON_CONTEXT_WINDOW`. Command-line options override matching environment settings; an environment key overrides a saved key. Noninteractive launches require an explicit endpoint, model, and an environment or matching saved key.
+For scripts and secret-manager integrations, the launcher accepts `ERAGON_CLIENT`, `ERAGON_ENDPOINT`, `ERAGON_MODEL`, `ERAGON_API_KEY`, and `ERAGON_CONTEXT_WINDOW`. Command-line options override matching environment settings; an environment key overrides a saved key. Noninteractive launches require an explicit endpoint, model, and an environment or matching saved key. Browser sign-in also reads `ERAGON_URL` and `ERAGON_NO_BROWSER`; `--login` needs an interactive terminal and replaces an environment key for that launch.
 
 See all options with:
 
@@ -195,12 +243,17 @@ eragon-router --help
 | Your Gateway does not offer a model list | Use `--model` with the exact ID supplied by your administrator. |
 | `Your input exceeds the context window` | Start a fresh session with a shorter summary, or select a model with a larger supported context. If the displayed capacity is wrong, ask your administrator for the actual limit and use `--context-window`. |
 | The client starts but requests or tool calls fail | Confirm that the Gateway supports the selected client's API and that the key can use the selected model. |
+| `Declined in the browser. Nothing was stored.` | The sign-in was denied in the browser. Run `eragon-router --login` again and approve it, after checking that the code matches. |
+| `The code expired before it was approved.` | Approve within about 15 minutes of starting. Run `eragon-router --login` again for a new code. |
+| `Your saved sign-in to … is no longer accepted.` | The sign-in was revoked, or your organization no longer allows the way you signed in. The launcher forgets it and starts a new sign-in. |
+| `Cannot tell which Eragon serves this Gateway` | Your Gateway URL does not end in `/gw`. Pass `--eragon-url https://your-eragon.example.com`, or set `ERAGON_URL`. |
+| `You have no active Gateway keys.` | Create a key in the Eragon web app at the address shown, then run the launcher again, or paste a key instead. |
 
 The Gateway must support Anthropic Messages for Claude Code, Responses for Codex, or Chat Completions for Pi and OpenCode, including streaming and tool calls. Eragon Router configures the client; it does not translate between these APIs. Model availability, usage charges, and access permissions are managed by your Gateway. Pi may display a zero cost estimate for custom models; Gateway usage can still be billed.
 
 ## Privacy
 
-Your chosen client sends the conversation and any project context it uses to your configured Gateway. Eragon Router does not add telemetry or change the client's own session storage, logging, or data policies. It does not modify the client's persistent login files. Optional Memory setup writes the MCP registration described above.
+Your chosen client sends the conversation and any project context it uses to your configured Gateway. Eragon Router does not add telemetry or change the client's own session storage, logging, or data policies. It does not modify the client's persistent login files. Optional Memory setup writes the MCP registration described above. Optional browser sign-in contacts your Eragon address only to sign in, read your profile, and list your Gateway keys.
 
 When requesting support, share the client name, version, and error message. Remove API keys and sensitive project content first.
 
