@@ -22,8 +22,8 @@ Usage: eragon-router [--client claude|codex|pi|opencode] [--endpoint HTTPS_URL] 
   --login         Sign in with your browser, then choose one of your own Gateway keys.
   --eragon-url URL  Eragon address for sign-in (default: the Gateway URL without /gw).
   --no-browser    Print the sign-in link and code instead of opening a browser.
-  --logout        Forget saved Eragon sign-ins on this machine and exit; with
-                  --endpoint or --eragon-url, only the sign-in for that Eragon.
+  --logout        Forget saved Eragon sign-ins on this machine and exit; with --endpoint,
+                  --eragon-url or ERAGON_URL, only the sign-in for that Eragon.
   --context-window TOKENS  Actual gateway context/input limit (Claude: >=125000; Pi: >=32768; others: >=4096).
   -v, --version   Show the installed router version.
   -h, --help      Show this help.

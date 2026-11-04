@@ -165,7 +165,7 @@ To forget the stored sign-ins on this machine:
 eragon-router --logout
 ```
 
-`--logout` forgets every stored sign-in, or only one with `--eragon-url` or `--endpoint`. It deletes the local copy only: the machine stays listed in Eragon, and the credential remains valid, until you revoke it in the web app under **Settings → Command line**. Saved Gateway keys and the `eragon` tool's own sign-in are left alone. `--forget-key` still removes saved Gateway keys only.
+`--logout` forgets every stored sign-in, or only one when `--eragon-url`, `ERAGON_URL` or `--endpoint` names an Eragon. It deletes the local copy only: the machine stays listed in Eragon, and the credential remains valid, until you revoke it in the web app under **Settings → Command line**. Saved Gateway keys and the `eragon` tool's own sign-in are left alone. `--forget-key` still removes saved Gateway keys only.
 
 ## Connect Eragon Memory
 
