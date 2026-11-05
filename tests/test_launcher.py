@@ -583,7 +583,8 @@ class LauncherTests(unittest.TestCase):
                                   keyActions=["invalid", ""])
         self.assertEqual(reply["exit"], 0)
         self.assertIn("Key action [1]", reply["output"])
-        self.assertIn("Enter 1, 2 or q", reply["output"])
+        # The fixture Gateway ends in /gw, so the menu also offers Eragon sign-in.
+        self.assertIn("Enter 1, 2, 3 or q", reply["output"])
         self.assertNotIn("Personal API Key", reply["output"])
 
     def test_saved_key_menu_update_preserves_other_gateways(self):
