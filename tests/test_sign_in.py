@@ -1,4 +1,5 @@
-"""Browser sign-in and choosing one of your own Gateway keys. Fixtures only: no network."""
+"""Browser sign-in, choosing one of your own Gateway keys, and creating one for
+this machine during the device flow (ERA-4108). Fixtures only: no network."""
 import json
 import pathlib
 import subprocess
@@ -14,6 +15,16 @@ SAVED = "ecli_fixture-saved-sign-in"
 CLI = "ecli_fixture-cli-sign-in"
 ME = {"userId": "usr_me", "email": "me@example.com", "orgRole": "member"}
 LINK = ERAGON + "/cli?code=ABCD-EFGH"
+START = "POST " + ERAGON + "/v1/auth/device/start"
+TOKEN = "POST " + ERAGON + "/v1/auth/device/token"
+CREATED = "Created eragon-router (me@laptop) …cret for this machine."
+CANNOT = ("This Eragon cannot create keys during sign-in yet. Create one at "
+          + ERAGON + "/ai-gateway/keys, then paste it.")
+UNUSABLE = ("Unexpected key from " + ERAGON + ". Nothing was stored; revoke the new key at "
+            + ERAGON + "/ai-gateway/keys.")
+# The start answer of an Eragon that can mint a key: it echoes the request.
+SIGN_IN_ECHO = {"gatewayKey": True, "signIn": True}
+KEY_ONLY_ECHO = {"gatewayKey": True, "signIn": False}
 
 
 def start(**overrides):
@@ -34,6 +45,13 @@ def key(name, last4, **fields):
               "secretLast4": last4, "allModels": True, "allowedPublicModelCount": 12,
               "allowedSmartRoutingGroups": [], "budget": None, "spendUsd": 0, "lastUsedAt": None,
               "createdAt": "2026-10-01T00:00:00.000Z"}
+    record.update(fields)
+    return record
+
+
+def created(name="eragon-router (me@laptop)", secret=KEY, last4="cret", **fields):
+    """The Gateway key an issued answer hands over, exactly once."""
+    record = {"id": "key_created", "name": name, "secret": secret, "secretLast4": last4, "expiresAt": None}
     record.update(fields)
     return record
 
@@ -78,7 +96,11 @@ class SignInTests(unittest.TestCase):
         self.assertIn("in your browser. Waiting… (Ctrl-C to cancel)", output)
         self.assertIn("Signed in to https://gateway.example.com as me@example.com.", output)
         self.assertIn("  1) CI runner …zzzz\r\n     3 models +2 routing groups · $3.10 spent · never used", output)
-        self.assertIn("  2) Laptop …cret · saved here\r\n     all models · $12.40 of $50 / 30d · last used 2026-11-01", output)
+        self.assertIn("  2) Laptop …cret · saved here\r\n     all models · $12.40 of $50 / 30d · last used 2026-11-01\r\n"
+                      "  n) Create a new key for this machine (approve in your browser)\r\n  q) Quit\r\n", output)
+        # A key is saved for this Gateway, so the sign-in asks for none, and
+        # Enter still picks the saved-here key.
+        self.assertEqual(reply["starts"], [{}])
         self.assertIn("Key number [2]: ", output)
         self.assertNotIn("Paste the secret", output)
         self.assertNotIn("Remember API key locally", output)
@@ -245,7 +267,8 @@ class SignInTests(unittest.TestCase):
         output = reply["output"]
         self.assertIn("  1) Evil[2JName …evl1\r\n", output)
         self.assertIn("  2) Mine …cret\r\n     all models · $0 spent · never used\r\n", output)
-        self.assertIn("  3) Older server\r\n  q) Quit\r\n2 expired or revoked keys hidden.\r\n", output)
+        self.assertIn("  3) Older server\r\n  n) Create a new key for this machine (approve in your browser)\r\n"
+                      "  q) Quit\r\n2 expired or revoked keys hidden.\r\n", output)
         for hidden in ["Colleague", "Partner", "Nobody", "Expired", "Revoked", "\x1b", "\x07", "\u202e"]:
             self.assertNotIn(hidden, output)
         self.assertIn("LAUNCHED", output)
@@ -287,7 +310,7 @@ class SignInTests(unittest.TestCase):
         reply = self.run_launcher(args=["--login", "--model", "coder"], noCatalogue=1, savedCredentials=saved,
                                   eragon=fixture, keyNumbers=["2", "0", "x", "1"], pastes=[KEY])
         self.assertEqual(reply["exit"], 0, reply["output"])
-        self.assertEqual(reply["output"].count("Enter one of the key numbers above, or q."), 3)
+        self.assertEqual(reply["output"].count("Enter one of the key numbers above, n or q."), 3)
         self.assertIn("LAUNCHED", reply["output"])
         reply = self.run_launcher(args=["--login", "--model", "coder"], noCatalogue=1, savedCredentials=saved,
                                   eragon=fixture, keyNumbers=["q"])
@@ -304,16 +327,20 @@ class SignInTests(unittest.TestCase):
         self.assertNotIn("saved here", reply["output"])
         self.assertIn("Paste the secret for Laptop (…cret): ", reply["output"])
 
-    def test_no_usable_keys_points_to_the_web_app(self):
+    def test_no_usable_keys_offer_to_create_or_paste_one(self):
         saved = {"last_endpoint": GATEWAY, "keys": {}, "sign_ins": {ERAGON: stored(SAVED)}}
         fixture = eragon(me={SAVED: {"body": ME}}, keys=[key("Gone", "gone", status="revoked")])
-        message = ("You have no active Gateway keys. Create one at https://gateway.example.com/ai-gateway/keys,"
-                   " then run again.\r\n1 expired or revoked key hidden.\r\n  1) Paste a key\r\n  q) Quit\r\n")
-        reply = self.run_launcher(args=["--login", "--model", "coder"], noCatalogue=1, savedCredentials=saved, eragon=fixture)
+        message = ("You have no active Gateway keys.\r\n1 expired or revoked key hidden.\r\n"
+                   "  1) Create a key for this machine (approve in your browser)\r\n  2) Paste a key\r\n  q) Quit\r\n")
+        reply = self.run_launcher(args=["--login", "--model", "coder"], noCatalogue=1, savedCredentials=saved,
+                                  eragon=fixture, keyActions=["x", "2"])
         self.assertEqual(reply["exit"], 0, reply["output"])
         self.assertIn(message, reply["output"])
+        self.assertIn("Enter 1, 2 or q.", reply["output"])
         self.assertIn("Personal API Key", reply["output"])
+        self.assertIn("Remember API key locally (owner-only plaintext file)? [y/N]: ", reply["output"])
         self.assertIn("LAUNCHED", reply["output"])
+        self.assertEqual(reply["starts"], [])
         reply = self.run_launcher(args=["--login", "--model", "coder"], noCatalogue=1, savedCredentials=saved,
                                   eragon=fixture, keyActions=["q"])
         self.assertEqual(reply["exit"], 1)
@@ -411,15 +438,20 @@ class SignInTests(unittest.TestCase):
     def test_inherited_variables_cannot_export_sign_in_secrets(self):
         planted = {name: "ecli_fixture-planted" for name in [
             "eragon_token", "stored_sign_in", "credential_secret", "hidden_input", "poll_request", "start_request",
-            "http_response", "http_body", "credential_json", "saved_credentials", "saved_key", "key_rows"]}
-        fixture = eragon([poll("issued", token=NEW)], keys=[key("Laptop", "cret")])
-        reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder", "--memory"], noCatalogue=1,
-                                  eragon=fixture, pastes=[KEY], environment=planted, expectMemoryData=True,
-                                  expectMemoryRegistration=True)
-        self.assertEqual(reply["exit"], 0, reply["output"])
-        self.assertIn("FIXTURE_MEMORY_REGISTERED", reply["output"])
-        self.assertIn("LAUNCHED", reply["output"])
-        self.assertEqual(reply["signIns"][ERAGON]["token"], NEW)
+            "http_response", "http_body", "credential_json", "saved_credentials", "saved_key", "key_rows", "new_key"]}
+        # A pasted key, then a key created for this machine: the fake curl
+        # checks that neither secret reaches its environment on any request.
+        for polls, pastes in [([poll("issued", token=NEW)], [KEY]),
+                              ([poll("issued", token=NEW, gatewayKey=created())], [])]:
+            with self.subTest(created="gatewayKey" in polls[0]["body"]):
+                fixture = eragon(polls, keys=[key("Laptop", "cret")], **SIGN_IN_ECHO)
+                reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder", "--memory"], noCatalogue=1,
+                                          eragon=fixture, pastes=pastes, environment=planted, expectMemoryData=True,
+                                          expectMemoryRegistration=True)
+                self.assertEqual(reply["exit"], 0, reply["output"])
+                self.assertIn("FIXTURE_MEMORY_REGISTERED", reply["output"])
+                self.assertIn("LAUNCHED", reply["output"])
+                self.assertEqual(reply["signIns"][ERAGON]["token"], NEW)
 
     def test_logout_forgets_only_router_sign_ins(self):
         other = "https://other.example.com"
@@ -479,6 +511,223 @@ class SignInTests(unittest.TestCase):
                                   savedCredentials={"last_endpoint": GATEWAY, "keys": {GATEWAY: KEY}, "sign_ins": "bad"})
         self.assertEqual(reply["exit"], 0)
         self.assertNotIn("savedEndpoints", reply)
+
+    # Creating a Gateway key for this machine in the device flow (ERA-4108).
+
+    def test_sign_in_creates_a_key_for_this_machine(self):
+        fixture = eragon([poll("pending"), poll("issued", token=NEW, gatewayKey=created())], **SIGN_IN_ECHO)
+        # No key saved for this Gateway, or one that is not an esk_ key: the sign-in asks for one.
+        for saved in [None, {"last_endpoint": GATEWAY, "keys": {GATEWAY: "sk-legacy-key-0000"}}]:
+            with self.subTest(saved=saved):
+                options = {} if saved is None else {"savedCredentials": saved}
+                reply = self.run_launcher(args=["--login", "--no-browser"], eragon=fixture, expectStorage=True, **options)
+                self.assertEqual(reply["exit"], 0, reply["output"])
+                output = reply["output"]
+                self.assertEqual(reply["starts"], [{"gatewayKey": True}])
+                self.assertIn('Approve "eragon-router (', output)
+                self.assertIn("Signed in to https://gateway.example.com as me@example.com.\r\n" + CREATED + "\r\n", output)
+                # The key is used directly: no key list, no paste, no hidden prompt.
+                for absent in ["Choose one of your Gateway keys", "Paste the secret", "Personal API Key",
+                               "Remember API key locally"]:
+                    self.assertNotIn(absent, output)
+                self.assertIn('LAUNCHED {"model": "claude-sonnet-5"', output)
+                # It reached the Gateway as a header on stdin (the fake curl checks the
+                # value), and Eragon was never asked to list or create keys.
+                self.assertEqual(reply["requests"], [START, TOKEN, TOKEN, "GET " + ERAGON + "/v1/me",
+                                                     "GET " + GATEWAY + "/v1/models"])
+                self.assertEqual(reply["signIns"][ERAGON]["token"], NEW)
+                # Enter at the save prompt saved it; the runner checks the stored value.
+                self.assertIn("Eragon cannot show this key's secret again. Saving uses an owner-only plaintext file.\r\n"
+                              "Save this key on this machine? [Y/n]: \r\n", output)
+                self.assertIn("Gateway and key remembered locally.", output)
+                self.assertEqual(reply["savedEndpoints"], [GATEWAY])
+
+    def test_a_key_the_sign_in_did_not_ask_for_is_ignored(self):
+        saved = {"last_endpoint": GATEWAY, "keys": {GATEWAY: KEY}}
+        fixture = eragon([poll("issued", token=NEW, gatewayKey=created(secret="esk_fixture-unasked", last4="sked"))],
+                         keys=[key("Laptop", "cret")])
+        reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder"], noCatalogue=1,
+                                  savedCredentials=saved, eragon=fixture)
+        self.assertEqual(reply["exit"], 0, reply["output"])
+        self.assertEqual(reply["starts"], [{}])
+        self.assertNotIn("Created", reply["output"])
+        self.assertNotIn("unasked", reply["output"])
+        self.assertIn("Using the key saved here for Laptop.", reply["output"])
+        self.assertIn("LAUNCHED", reply["output"])
+
+    def test_key_only_request_from_the_key_list_keeps_the_sign_in(self):
+        saved = {"last_endpoint": GATEWAY, "keys": {}, "sign_ins": {ERAGON: stored(SAVED)}}
+        # A token in a key-only answer is not asked for, and is ignored.
+        for issued in [poll("issued", gatewayKey=created()),
+                       poll("issued", token="ecli_fixture-unasked", gatewayKey=created())]:
+            with self.subTest(token="token" in issued["body"]):
+                fixture = eragon([poll("pending"), issued], me={SAVED: {"body": ME}},
+                                 keys=[key("CI runner", "zzzz")], **KEY_ONLY_ECHO)
+                reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder"], noCatalogue=1,
+                                          savedCredentials=saved, eragon=fixture, keyNumbers=["n"], saveChoices=["n"])
+                self.assertEqual(reply["exit"], 0, reply["output"])
+                output = reply["output"]
+                self.assertIn("  1) CI runner …zzzz\r\n     all models · $0 spent · never used\r\n"
+                              "  n) Create a new key for this machine (approve in your browser)\r\n  q) Quit\r\n"
+                              "Key number [1]: n\r\n", output)
+                self.assertIn("Open  " + LINK + "\r\nCode  ABCD-EFGH\r\n\r\n"
+                              "Approve and create the key in your browser. Waiting… (Ctrl-C to cancel)\r\n", output)
+                self.assertIn(CREATED, output)
+                self.assertNotIn("Paste the secret", output)
+                self.assertEqual(reply["starts"], [{"gatewayKey": True, "signIn": False}])
+                self.assertEqual(reply["requests"], ["GET " + ERAGON + "/v1/me", "GET " + ERAGON + "/v1/gateway-keys",
+                                                     START, TOKEN, TOKEN])
+                self.assertEqual(reply["sleeps"], ["5", "5"])
+                self.assertIn("LAUNCHED", output)
+                # The stored sign-in is kept as it was, and "n" kept the key off the disk.
+                self.assertEqual(reply["signIns"], saved["sign_ins"])
+                self.assertEqual(reply["savedEndpoints"], [])
+
+    def test_no_usable_keys_create_one_by_default(self):
+        saved = {"last_endpoint": GATEWAY, "keys": {}, "sign_ins": {ERAGON: stored(SAVED)}}
+        fixture = eragon([poll("issued", gatewayKey=created())], me={SAVED: {"body": ME}},
+                         keys=[key("Gone", "gone", status="revoked")], **KEY_ONLY_ECHO)
+        reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder"], noCatalogue=1,
+                                  savedCredentials=saved, eragon=fixture)
+        self.assertEqual(reply["exit"], 0, reply["output"])
+        output = reply["output"]
+        self.assertIn("  1) Create a key for this machine (approve in your browser)\r\n  2) Paste a key\r\n  q) Quit\r\n"
+                      "Key action [1]: \r\nOpen  " + LINK, output)
+        self.assertIn("Approve and create the key in your browser.", output)
+        self.assertIn(CREATED, output)
+        self.assertNotIn("Personal API Key", output)
+        self.assertEqual(reply["starts"], [{"gatewayKey": True, "signIn": False}])
+        self.assertEqual(reply["signIns"], saved["sign_ins"])
+        self.assertEqual(reply["savedEndpoints"], [GATEWAY])
+        self.assertIn("LAUNCHED", output)
+
+    def test_older_eragon_without_the_echo(self):
+        saved = {"last_endpoint": GATEWAY, "keys": {}, "sign_ins": {ERAGON: stored(SAVED)}}
+        # A key alone is never polled without its echo: an older Eragon would
+        # answer it with a sign-in. Nor is one echoed as a sign-in. The message,
+        # then the same menu; Eragon is not asked twice.
+        for echo in [{}, SIGN_IN_ECHO]:
+            with self.subTest(key_only_echo=echo):
+                fixture = eragon(me={SAVED: {"body": ME}}, keys=[key("Laptop", "cret")], **echo)
+                reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder"], noCatalogue=1,
+                                          savedCredentials=saved, eragon=fixture, keyNumbers=["n", "n", "1"], pastes=[KEY])
+                self.assertEqual(reply["exit"], 0, reply["output"])
+                output = reply["output"]
+                self.assertEqual(output.count("Key number [1]: n\r\n" + CANNOT + "\r\n"), 2)
+                self.assertNotIn("Open  ", output)
+                self.assertEqual(reply["starts"], [{"gatewayKey": True, "signIn": False}])
+                self.assertEqual(reply["requests"], ["GET " + ERAGON + "/v1/me", "GET " + ERAGON + "/v1/gateway-keys", START])
+                self.assertEqual(reply["sleeps"], [])
+                self.assertIn("Paste the secret for Laptop (…cret): ", output)
+                # Every other key keeps the opt-in remember prompt.
+                self.assertIn("Remember API key locally (owner-only plaintext file)? [y/N]: ", output)
+                self.assertNotIn("Save this key on this machine", output)
+                self.assertIn("LAUNCHED", output)
+                self.assertEqual(reply["signIns"], saved["sign_ins"])
+        # A sign-in is polled as before. With no key in the answer the key list
+        # follows: an older Eragon, a person who turned the key off, or null.
+        for echo, issued in [({}, poll("issued", token=NEW)),
+                             (SIGN_IN_ECHO, poll("issued", token=NEW)),
+                             (SIGN_IN_ECHO, poll("issued", token=NEW, gatewayKey=None))]:
+            with self.subTest(echo=echo, issued=issued):
+                fixture = eragon([issued], keys=[key("Laptop", "cret")], **echo)
+                reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder"], noCatalogue=1,
+                                          eragon=fixture, pastes=[KEY], expectStorage=True)
+                self.assertEqual(reply["exit"], 0, reply["output"])
+                self.assertEqual(reply["starts"], [{"gatewayKey": True}])
+                self.assertEqual(reply["requests"], [START, TOKEN, "GET " + ERAGON + "/v1/me",
+                                                     "GET " + ERAGON + "/v1/gateway-keys"])
+                self.assertIn("Paste the secret for Laptop (…cret): ", reply["output"])
+                self.assertIn("Remember API key locally (owner-only plaintext file)? [y/N]: ", reply["output"])
+                self.assertNotIn("Created ", reply["output"])
+                self.assertEqual(reply["signIns"][ERAGON]["token"], NEW)
+        # After a sign-in an older Eragon ignored, creating a key is not tried.
+        fixture = eragon([poll("issued", token=NEW)], keys=[])
+        reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder"], noCatalogue=1,
+                                  eragon=fixture, keyActions=["", "2"], expectStorage=True)
+        self.assertEqual(reply["exit"], 0, reply["output"])
+        self.assertIn("Key action [1]: \r\n" + CANNOT + "\r\nKey action [1]: 2\r\n", reply["output"])
+        self.assertEqual(reply["starts"], [{"gatewayKey": True}])
+        self.assertIn("Personal API Key", reply["output"])
+        self.assertIn("LAUNCHED", reply["output"])
+
+    def test_unusable_created_keys_store_nothing(self):
+        cases = {"last four do not match": created(last4="zzzz"),
+                 "not an esk_ key": created(secret="sk-fixture-secret"),
+                 "line break": created(secret=KEY + "\r\nX-cret"),
+                 "too short": created(secret="esk_ret", last4="_ret"),
+                 "no last four": created(last4=None),
+                 "short last four": created(last4="ret"),
+                 "empty last four": created(last4=""),
+                 "no name": created(name=None),
+                 "not an object": KEY,
+                 "false": False}
+        for case, bad in cases.items():
+            with self.subTest(case=case):
+                # With a sign-in: refused before /v1/me, so not even the sign-in is stored.
+                fixture = eragon([poll("issued", token=NEW, gatewayKey=bad)], **SIGN_IN_ECHO)
+                reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder"], noCatalogue=1,
+                                          eragon=fixture)
+                self.assertEqual(reply["exit"], 1, reply["output"])
+                self.assertIn(UNUSABLE, reply["output"])
+                self.assertNotIn("Signed in", reply["output"])
+                self.assertNotIn("LAUNCHED", reply["output"])
+                self.assertEqual(reply["requests"], [START, TOKEN])
+                self.assertNotIn("signIns", reply)
+                self.assertNotIn("savedEndpoints", reply)
+        saved = {"last_endpoint": GATEWAY, "keys": {}, "sign_ins": {ERAGON: stored(SAVED)}}
+        for case, issued, message in [("bad prefix", poll("issued", gatewayKey=created(secret="sk-fixture-secret")), UNUSABLE),
+                                      ("mismatch", poll("issued", gatewayKey=created(last4="zzzz")), UNUSABLE),
+                                      ("no key", poll("issued"), "Unexpected answer from " + ERAGON +
+                                       " while waiting for approval. Nothing was stored.")]:
+            with self.subTest(case="key only: " + case):
+                fixture = eragon([issued], me={SAVED: {"body": ME}}, keys=[], **KEY_ONLY_ECHO)
+                reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder"], noCatalogue=1,
+                                          savedCredentials=saved, eragon=fixture)
+                self.assertEqual(reply["exit"], 1, reply["output"])
+                self.assertIn(message, reply["output"])
+                self.assertNotIn("LAUNCHED", reply["output"])
+                self.assertEqual(reply["signIns"], saved["sign_ins"])
+                self.assertEqual(reply["savedEndpoints"], [])
+
+    def test_unfinished_key_requests_keep_the_sign_in(self):
+        saved = {"last_endpoint": GATEWAY, "keys": {}, "sign_ins": {ERAGON: stored(SAVED)}}
+        cases = [([poll("denied")], {}, 1, "Declined in the browser. Nothing was stored."),
+                 ([poll("expired")], {}, 1, "The code expired before it was approved."),
+                 ([poll("issued", gatewayKey=created())], {"interruptWaiting": True,
+                                                          "environment": {"FIXTURE_REAL_SLEEP": "1"}}, 130, "Waiting…")]
+        for polls, extra, status, message in cases:
+            with self.subTest(message=message):
+                fixture = eragon(polls, me={SAVED: {"body": ME}}, keys=[], **KEY_ONLY_ECHO)
+                reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder"], noCatalogue=1,
+                                          savedCredentials=saved, eragon=fixture, **extra)
+                self.assertEqual(reply["exit"], status, reply["output"])
+                self.assertIn(message, reply["output"])
+                self.assertNotIn("Created", reply["output"])
+                self.assertNotIn("LAUNCHED", reply["output"])
+                self.assertEqual(reply["signIns"], saved["sign_ins"])
+                self.assertEqual(reply["savedEndpoints"], [])
+
+    def test_created_key_is_saved_unless_declined(self):
+        fixture = eragon([poll("issued", token=NEW, gatewayKey=created())], **SIGN_IN_ECHO)
+        for choices, kept in [([""], True), (["Y"], True), (["n"], False), (["NO"], False), (["maybe", "y"], True)]:
+            with self.subTest(choices=choices):
+                reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder"], noCatalogue=1,
+                                          eragon=fixture, saveChoices=choices, expectStorage=True)
+                self.assertEqual(reply["exit"], 0, reply["output"])
+                output = reply["output"]
+                self.assertEqual(output.count("Save this key on this machine? [Y/n]: "), len(choices))
+                self.assertEqual(output.count("Enter y or n."), len(choices) - 1)
+                self.assertNotIn("Remember API key locally", output)
+                self.assertEqual(reply["savedEndpoints"], [GATEWAY] if kept else [])
+                self.assertEqual("Gateway and key remembered locally." in output, kept)
+                self.assertIn("LAUNCHED", output)
+        # --remember-key saves it without asking.
+        reply = self.run_launcher(args=["--login", "--no-browser", "--model", "coder", "--remember-key"], noCatalogue=1,
+                                  eragon=fixture, expectStorage=True)
+        self.assertEqual(reply["exit"], 0, reply["output"])
+        self.assertNotIn("Save this key on this machine", reply["output"])
+        self.assertEqual(reply["savedEndpoints"], [GATEWAY])
 
 
 if __name__ == "__main__":

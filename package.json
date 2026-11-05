@@ -1,6 +1,6 @@
 {
   "name": "eragon-router",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Connect Claude Code, Codex, Pi Agent and OpenCode to your model Gateway.",
   "license": "MIT",
   "repository": {

@@ -1,7 +1,9 @@
 # Test fixtures only. No real credentials or network requests.
 
-import os, sys, json, tempfile, pathlib, pty, select, time, termios, subprocess
+import os, sys, json, tempfile, pathlib, pty, select, time, termios, subprocess, shutil, shlex
 request = json.load(sys.stdin)
+REAL_JQ = shutil.which('jq')
+assert REAL_JQ, 'jq is required to run the launcher tests'
 # The Gateway key the fixture clients expect; sign-in tests use an esk_ key.
 KEY = request.get('fixtureKey', 'fixture-secret')
 with tempfile.TemporaryDirectory() as directory:
@@ -22,6 +24,7 @@ assert all('fixture-secret' not in arg for arg in sys.argv)
 # Sign-in tokens (ecli_) and device codes (edc_) never travel as arguments.
 assert all('ecli_' not in arg and 'edc_' not in arg for arg in sys.argv), 'sign-in secret in curl arguments'
 assert all('ecli_' not in value and 'edc_' not in value for value in os.environ.values()), 'sign-in secret in curl environment'
+assert all('fixture-secret' not in value for value in os.environ.values()), 'Gateway key in curl environment'
 assert sys.argv[1] == '-q'
 assert '--location' not in sys.argv and '-L' not in sys.argv
 assert args[args.index('--proto') + 1] == '=https'
@@ -55,13 +58,28 @@ def bearer():
     return stdin[len('Authorization: Bearer '):-1]
 if path == '/v1/auth/device/start':
     assert post and args[args.index('--data-binary') + 1] == '@-'
-    label = json.loads(stdin)['label']
+    started = json.loads(stdin)
+    label = started['label']
     assert label.startswith('eragon-router (') and label.isascii() and label.isprintable() and len(label) <= 120, label
+    # Only the contract's fields: gatewayKey:true asks for a key, and signIn:false
+    # (a key alone, no sign-in) is only ever sent with it.
+    assert set(started) <= {'label', 'gatewayKey', 'signIn'}, started
+    assert started.get('gatewayKey', True) is True and started.get('signIn', False) is False, started
+    assert 'signIn' not in started or 'gatewayKey' in started, started
     with open(log / 'labels', 'a') as record: record.write(label + '\n')
-    answer(eragon['start'])
+    with open(log / 'starts', 'a') as record: record.write(json.dumps(started) + '\n')
+    # One answer per start, in order ("starts"), or the same one each time ("start").
+    counter = log / 'start-count'
+    index = int(counter.read_text()) if counter.exists() else 0
+    counter.write_text(str(index + 1))
+    starts = eragon['starts'] if 'starts' in eragon else [eragon['start']]
+    entry = starts[min(index, len(starts) - 1)]
+    body = entry.get('body')
+    (log / 'device-code').write_text(body['deviceCode'] if isinstance(body, dict) and 'deviceCode' in body else '')
+    answer(entry)
 if path == '/v1/auth/device/token':
     assert post and args[args.index('--data-binary') + 1] == '@-'
-    assert json.loads(stdin) == {'deviceCode': eragon['start']['body']['deviceCode']}
+    assert json.loads(stdin) == {'deviceCode': (log / 'device-code').read_text()}
     counter = log / 'polls'
     index = int(counter.read_text()) if counter.exists() else 0
     counter.write_text(str(index + 1))
@@ -83,6 +101,13 @@ raise AssertionError('unexpected request to ' + url)
     # Never open a real browser: record what would have been opened.
     for opener in ["open", "xdg-open"]:
         (root / opener).write_text('#!/bin/sh\nprintf \'%s %s\\n\' "${0##*/}" "$*" >> "$FIXTURE_LOG/opened"\n')
+    # The real jq, behind a guard: a Gateway key, sign-in token or device code
+    # passed as a jq argument is recorded, and the run then fails, even where
+    # the launcher ignores jq's exit status.
+    jq = root / "jq"
+    jq.write_text('#!/bin/sh\ncase "$*" in *fixture-secret*|*ecli_fixture*|*edc_fixture*)\n'
+                  '  printf \'%s\\n\' "$*" >> "$FIXTURE_LOG/jq-argv-secrets" ;;\nesac\n'
+                  'exec ' + shlex.quote(REAL_JQ) + ' "$@"\n')
     claude = root / "claude"
     claude.write_text("""#!/usr/bin/env python3
 import os, sys, json
@@ -262,9 +287,9 @@ if os.environ.get('CHECK_MEMORY_CHILD') == '1':
 """
         source = source.replace("assert os.environ['ERAGON_ROUTER_TOKEN'] == 'fixture-secret'", "assert os.environ['ERAGON_ROUTER_TOKEN'] == 'fixture-secret'\n" + check, 1)
         client_path.write_text(source)
-    for path in [curl, claude, codex, pi, opencode, bridge_installer, npm, memory_bridge]:
+    for path in [curl, claude, codex, pi, opencode, bridge_installer, npm, memory_bridge, jq]:
         path.write_text(path.read_text().replace('fixture-secret', KEY))
-    for path in [curl, claude, codex, pi, opencode, sleep, root / 'open', root / 'xdg-open']: path.chmod(0o700)
+    for path in [curl, claude, codex, pi, opencode, sleep, jq, root / 'open', root / 'xdg-open']: path.chmod(0o700)
     environment = dict(os.environ, PATH=directory + os.pathsep + os.environ['PATH'],
         MODEL_RESPONSE=request['models'], CURL_FAIL=str(request.get('curlFail', 0)),
         ANTHROPIC_API_KEY='stale', CLAUDE_CODE_DISABLE_THINKING='1')
@@ -331,9 +356,13 @@ if os.environ.get('CHECK_MEMORY_CHILD') == '1':
         calls = [json.loads(line) for line in calls_log.read_text().splitlines()] if calls_log.exists() else []
         for call in calls:
             assert all('ecli_' not in arg and 'edc_' not in arg for arg in call['argv']), call['argv']
+        assert not (log / 'jq-argv-secrets').exists(), 'a secret was a jq argument'
         result['requests'] = [('POST ' if call['post'] else 'GET ') + call['url'] for call in calls]
         for name in ['sleeps', 'labels']:
             result[name] = (log / name).read_text().splitlines() if (log / name).exists() else []
+        # What each device sign-in start asked for, label aside.
+        starts = (log / 'starts').read_text().splitlines() if (log / 'starts').exists() else []
+        result['starts'] = [{k: v for k, v in json.loads(line).items() if k != 'label'} for line in starts]
         opened = log / 'opened'
         if request.get('expectOpened'):
             # The browser opener runs detached; give it a moment to record.
@@ -357,7 +386,7 @@ if os.environ.get('CHECK_MEMORY_CHILD') == '1':
         return result
 
     expected_files = ['claude', 'codex', 'curl', 'eragon.sh', 'pi', 'opencode', 'memory-bridge.py', 'bridge-installer.py', 'node', 'npm',
-                      'sleep', 'open', 'xdg-open', 'log']
+                      'sleep', 'open', 'xdg-open', 'jq', 'log']
     if request.get('expectStorage') or 'savedCredentials' in request or request.get('symlinkCredentials') or request.get('expectMemoryRegistration'):
         expected_files.append('config')
     if 'cliCredentials' in request:
@@ -388,6 +417,8 @@ if os.environ.get('CHECK_MEMORY_CHILD') == '1':
     client_prompts_seen = 0
     sent_gateway = False
     sent_remember = False
+    save_choices = iter(request.get("saveChoices", [""]))
+    save_prompts_seen = 0
     memory_choices = iter(request.get("memoryChoices", [""]))
     memory_prompts_seen = 0
     key_actions = iter(request.get("keyActions", [""]))
@@ -409,6 +440,10 @@ if os.environ.get('CHECK_MEMORY_CHILD') == '1':
             os.write(fd, (request.get('gatewayInput', '') + '\n').encode()); sent_gateway = True
         if not sent_remember and b'Remember API key locally (owner-only plaintext file)? [y/N]: ' in transcript:
             os.write(fd, (request.get('rememberChoice', '') + '\n').encode()); sent_remember = True
+        # A key created for this machine asks to be saved, yes by default.
+        save_count = transcript.count(b'Save this key on this machine? [Y/n]: ')
+        if save_count > save_prompts_seen:
+            os.write(fd, (next(save_choices, '') + '\n').encode()); save_prompts_seen = save_count
         memory_count = transcript.count(b'Memory setup [1]: ')
         if memory_count > memory_prompts_seen:
             action = next(memory_choices, '')

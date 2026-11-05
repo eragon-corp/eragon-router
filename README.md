@@ -50,9 +50,9 @@ The launcher guides you through these steps:
 
 1. **Enter your Gateway URL.** Use the HTTPS base URL supplied by your administrator. No Gateway address is built in.
 2. **Choose a client.** Select Claude Code, Codex, Pi Agent, or OpenCode.
-3. **Enter your API key.** Input is hidden, so nothing appears as you type or paste. With an Eragon Gateway, you can instead [sign in with your browser](#sign-in-to-choose-a-key) and choose one of your keys.
+3. **Enter your API key.** Input is hidden, so nothing appears as you type or paste. With an Eragon Gateway, you can instead [sign in with your browser](#sign-in-to-choose-a-key) and choose one of your keys, or create one for this machine.
 4. **Choose a model.** Enter a number, or type `/keyword` to search.
-5. **Choose whether to remember your key.** Enter `y` to save it locally, or press Enter to use it for this run only.
+5. **Choose whether to remember your key.** Enter `y` to save it locally, or press Enter to use it for this run only. A key created for this machine during sign-in is the exception: Enter saves it, because Eragon cannot show its secret again.
 6. **Set up Eragon Memory (optional).** Choose `2` to automatically install the Memory bridge and connect it to this client, or press Enter to skip setup.
 
 Your selected client then opens in your current project folder.
@@ -124,7 +124,7 @@ Keys are not displayed or placed in command arguments. Do not paste a key into a
 
 ## Sign in to choose a key
 
-If your Gateway belongs to Eragon (its URL ends in `/gw`), you can sign in with a browser where you already use Eragon, then choose one of your own Gateway keys:
+If your Gateway belongs to Eragon (its URL ends in `/gw`), you can sign in with a browser where you already use Eragon, then choose one of your own Gateway keys, or create a new one for this machine without copying its secret:
 
 ```bash
 eragon-router --login
@@ -142,20 +142,56 @@ You can also pick **Choose from your Eragon keys (sign in with your browser)** i
    ```
 
    Check that the code matches, then approve. If the browser is not signed in to Eragon, the web app asks you to sign in first. The code expires after about 15 minutes. This is the same approval as `eragon login`; the launcher never reads your browser's cookies.
-2. **Choose a key.** The launcher lists the Gateway keys you created that are still active. Each entry shows the key's name, the last four characters of its secret, its model access, spend and budget, and when it was last used. Keys created by other people, keys provisioned by a partner, and expired or revoked keys are not listed; the launcher prints how many of your own keys it hid.
+
+   If no key is saved for this Gateway, the approval page also offers to **create a Gateway key for this machine**, turned on. Choose the key's name, model access, budget and expiry as on the Keys page, then approve. The launcher receives the key, prints `Created <name> …<last4> for this machine.`, and skips steps 2 and 3. Turn the option off to approve the sign-in only. If you may not create Gateway keys, the page says why and offers the sign-in only.
+2. **Choose a key.** The launcher lists the Gateway keys you created that are still active. Each entry shows the key's name, the last four characters of its secret, its model access, spend and budget, and when it was last used. Keys created by other people, keys provisioned by a partner, and expired or revoked keys are not listed; the launcher prints how many of your own keys it hid. Choose `n` to create a new key for this machine instead (see below).
 3. **Provide the secret.** A key marked **saved here** uses the key this launcher already saved for this Gateway. For any other key, paste its secret when asked. Input is hidden, and the launcher refuses a secret that does not end with the four characters shown. Eragon's key list never includes secrets, so use the secret you kept when you created the key.
 
-The model menu and the remember prompt then work as usual. The launcher never creates Gateway keys. If you have none, create one in the web app at `https://your-eragon.example.com/ai-gateway/keys` (your own Eragon address), then run the launcher again, or paste a key instead.
+The model menu and the remember prompt then work as usual. If you have no active keys, the launcher offers to create one:
+
+```text
+You have no active Gateway keys.
+  1) Create a key for this machine (approve in your browser)
+  2) Paste a key
+  q) Quit
+Key action [1]:
+```
 
 On a remote or headless machine, add `--no-browser` (or set `ERAGON_NO_BROWSER=1`) and open the printed link on any device where you can sign in to Eragon.
 
 The launcher finds your Eragon address by removing `/gw` from the Gateway URL. If your Gateway URL does not end in `/gw`, pass the address with `--eragon-url https://your-eragon.example.com`, or set `ERAGON_URL`.
 
+### Create a key for this machine
+
+A new sign-in asks for a key for this machine when none is saved for this Gateway, as step 1 describes. Once you are signed in, choosing `n` in the key list, or `1` when you have no active keys, asks Eragon for a key without a new sign-in, and keeps your sign-in as it is. The launcher prints a new link and code:
+
+```text
+Open  https://your-eragon.example.com/cli?code=WXYZ-2345
+Code  WXYZ-2345
+
+Approve and create the key in your browser. Waiting… (Ctrl-C to cancel)
+```
+
+In the browser, check the code, choose the key's settings, and approve. Only a person at the browser can create the key, with the same permissions and limits as the Keys page. The launcher only asks: it never creates, edits or revokes a key itself. If you may not create Gateway keys, the approval page says why, and you can only deny the request.
+
+Either way, the key goes straight to this machine, exactly once, and is used like a pasted key: hidden, never placed in command arguments, and never printed. After the model menu the launcher asks:
+
+```text
+Eragon cannot show this key's secret again. Saving uses an owner-only plaintext file.
+Save this key on this machine? [Y/n]:
+```
+
+Press Enter to save it, or enter `n` to use it for this run only. Every other key keeps the `[y/N]` prompt.
+
+Each key created this way appears on the Keys page in the web app, at `https://your-eragon.example.com/ai-gateway/keys` (your own Eragon address), under the name you chose. Revoke it there when you no longer need it, for example when you retire the machine.
+
+An Eragon server without this feature still signs you in, and then lists your keys as before. Choosing to create a key there prints `This Eragon cannot create keys during sign-in yet.` with the Keys page address: create a key in the web app, then paste it.
+
 ### What the sign-in stores
 
 After you approve, the launcher stores an Eragon CLI credential for that Eragon address, with your email address and the time you signed in. It goes into the same local file as saved keys, `~/.config/eragon-router/credentials.json`. Like saved keys, it is **plaintext**, protected only by owner-only permissions (`600` for the file, `700` for its directory). It is not encrypted.
 
-This credential acts as you. It can do what you can do through the Eragon web API, apart from a few actions Eragon reserves for the browser, such as approving devices and creating Gateway keys. The launcher uses it only to read your profile and list your keys, but anyone who can read the file could use it for more. Treat the file like a password. The credential is never placed in command arguments or passed to the client you launch.
+This credential acts as you. It can do what you can do through the Eragon web API, apart from a few actions Eragon reserves for the browser, such as approving devices and creating Gateway keys. The launcher uses it only to read your profile and list your keys, but anyone who can read the file could use it for more. Treat the file like a password. The credential is never placed in command arguments or passed to the client you launch. Creating a key for this machine does not use it: that request is approved in the browser, like the sign-in itself.
 
 Next time, the launcher reuses the stored sign-in while Eragon still accepts it, and starts a new sign-in when it does not. If you already signed in to the same Eragon with the `eragon` command-line tool, the launcher can reuse that sign-in too. It reads that tool's file and never changes it.
 
@@ -243,17 +279,19 @@ eragon-router --help
 | Your Gateway does not offer a model list | Use `--model` with the exact ID supplied by your administrator. |
 | `Your input exceeds the context window` | Start a fresh session with a shorter summary, or select a model with a larger supported context. If the displayed capacity is wrong, ask your administrator for the actual limit and use `--context-window`. |
 | The client starts but requests or tool calls fail | Confirm that the Gateway supports the selected client's API and that the key can use the selected model. |
-| `Declined in the browser. Nothing was stored.` | The sign-in was denied in the browser. Run `eragon-router --login` again and approve it, after checking that the code matches. |
+| `Declined in the browser. Nothing was stored.` | The sign-in or key request was denied in the browser. Run `eragon-router --login` again and approve it, after checking that the code matches. If you may not create Gateway keys, a key request can only be denied: paste a key instead, or ask an organization owner. |
 | `The code expired before it was approved.` | Approve within about 15 minutes of starting. Run `eragon-router --login` again for a new code. |
 | `Your saved sign-in to … is no longer accepted.` | The sign-in was revoked, or your organization no longer allows the way you signed in. The launcher forgets it and starts a new sign-in. |
 | `Cannot tell which Eragon serves this Gateway` | Your Gateway URL does not end in `/gw`. Pass `--eragon-url https://your-eragon.example.com`, or set `ERAGON_URL`. |
-| `You have no active Gateway keys.` | Create a key in the Eragon web app at the address shown, then run the launcher again, or paste a key instead. |
+| `You have no active Gateway keys.` | Press Enter to create a key for this machine and approve it in your browser, or choose `2` to paste a key. |
+| `This Eragon cannot create keys during sign-in yet.` | Your Eragon server does not support creating keys from the launcher yet. Create a key in the web app at the address shown, then paste it. |
+| `Unexpected key from …` | Eragon sent a key the launcher could not check, so it used and stored nothing, not even the sign-in. Revoke the new key on the Keys page at the address shown, then try again. |
 
 The Gateway must support Anthropic Messages for Claude Code, Responses for Codex, or Chat Completions for Pi and OpenCode, including streaming and tool calls. Eragon Router configures the client; it does not translate between these APIs. Model availability, usage charges, and access permissions are managed by your Gateway. Pi may display a zero cost estimate for custom models; Gateway usage can still be billed.
 
 ## Privacy
 
-Your chosen client sends the conversation and any project context it uses to your configured Gateway. Eragon Router does not add telemetry or change the client's own session storage, logging, or data policies. It does not modify the client's persistent login files. Optional Memory setup writes the MCP registration described above. Optional browser sign-in contacts your Eragon address only to sign in, read your profile, and list your Gateway keys.
+Your chosen client sends the conversation and any project context it uses to your configured Gateway. Eragon Router does not add telemetry or change the client's own session storage, logging, or data policies. It does not modify the client's persistent login files. Optional Memory setup writes the MCP registration described above. Optional browser sign-in contacts your Eragon address only to sign in, read your profile, list your Gateway keys, and receive a key you approve for this machine.
 
 When requesting support, share the client name, version, and error message. Remove API keys and sensitive project content first.
 

@@ -19,7 +19,8 @@ Usage: eragon-router [--client claude|codex|pi|opencode] [--endpoint HTTPS_URL] 
   --remember-key  Save this Gateway and key locally (owner-only plaintext file).
   --update-key    Prompt for a replacement key for this Gateway, save on launch.
   --forget-key    Delete all locally remembered Gateway credentials and exit.
-  --login         Sign in with your browser, then choose one of your own Gateway keys.
+  --login         Sign in with your browser, then choose one of your own Gateway keys,
+                  or create one for this machine that you approve in the browser.
   --eragon-url URL  Eragon address for sign-in (default: the Gateway URL without /gw).
   --no-browser    Print the sign-in link and code instead of opening a browser.
   --logout        Forget saved Eragon sign-ins on this machine and exit; with --endpoint,
@@ -37,9 +38,12 @@ Optional ERAGON_COMPATIBILITY_FILE: local verified-profile JSON (no keys/URLs).
 Flags override environment values and remembered credentials.
 Without an endpoint, prompt for a Gateway URL (Enter uses the last saved URL).
 Without a key, offer to use/update a matching saved key, or prompt with hidden input.
-An Eragon Gateway (URL ending in /gw) also offers to sign in and choose one of your keys.
+An Eragon Gateway (URL ending in /gw) also offers to sign in and choose one of your keys,
+or to create a key for this machine: you set it up and approve it in the browser, Eragon
+hands it to this machine once, and it appears on the Keys page, where you can revoke it.
 Local storage: ${XDG_CONFIG_HOME:-$HOME/.config}/eragon-router/credentials.json.
-Saving is opt-in; keys are plaintext with directory 700 / file 600 permissions.
+Saving is opt-in, except that Enter saves a key created for this machine;
+keys are plaintext with directory 700 / file 600 permissions.
 A sign-in is stored in the same file. --logout forgets it on this machine only;
 revoke it in the Eragon web app under Settings → Command line.
 Model menu: /text searches all usable models, / clears, m shows unverified.
@@ -51,7 +55,7 @@ HELP
 # through function locals.
 unset endpoint selected eragon_key context_limit client saved_credentials credential_json \
   credential_secret saved_key eragon_url eragon_token stored_sign_in hidden_input \
-  start_request poll_request http_response http_body eragon_user eragon_email key_rows
+  start_request poll_request http_response http_body eragon_user eragon_email key_rows new_key
 eragon_key=${ERAGON_API_KEY-}
 unset ERAGON_API_KEY ERAGON_ROUTER_TOKEN ERAGON_GATEWAY_URL
 endpoint=${ERAGON_ENDPOINT-}
@@ -61,6 +65,9 @@ client=${ERAGON_CLIENT-}
 eragon_url_setting=${ERAGON_URL-}
 search_query=''; remember_key=0; forget_key=0; prompted_key=0; update_key=0; using_saved_key=0; memory_setup=ask
 sign_in=0; sign_out=0; no_browser=0; endpoint_flag=0; eragon_url_flag=0
+# created_here: the key in use was created for this machine during this run.
+# create_unsupported: this Eragon ignored a request for a key (older than ERA-4108).
+created_here=0; create_unsupported=0
 case "${ERAGON_NO_BROWSER-}" in ''|0) ;; *) no_browser=1 ;; esac
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -82,7 +89,7 @@ while [[ $# -gt 0 ]]; do
     --login) sign_in=1; shift ;;
     --logout) sign_out=1; shift ;;
     --no-browser) no_browser=1; shift ;;
-    -v|--version) printf 'Eragon Router 0.2.0\n'; exit 0 ;;
+    -v|--version) printf 'Eragon Router 0.3.0\n'; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     *) fail 'Unknown option. Run eragon-router --help (or bash eragon.sh --help).' ;;
   esac
@@ -324,7 +331,9 @@ read_hidden() {
 # `eragon login`: a browser that is already signed in approves this machine.
 # The resulting ecli_ token is a personal credential. It reaches curl only on
 # stdin, is never exported or printed, and is stored only in the credential
-# file above. Gateway keys are listed here, never created.
+# file above. The same flow may ask for a Gateway key for this machine: the
+# person decides in the browser, and Eragon mints the key when this script
+# collects the approval. This script lists keys and never creates one itself.
 jq_clean='def clean: tostring | explode | map(select((. >= 32 and . < 127) or
   (. >= 160 and . != 173 and (. < 8203 or . > 8207) and (. < 8232 or . > 8238) and
    (. < 8288 or . > 8303) and . != 65279))) | implode;'
@@ -378,12 +387,21 @@ eragon_cli_token() {
   jq -r --arg url "$eragon_url" '[.credentials[]? | select(type == "object" and .url == $url) |
     .token | select(type == "string" and test("\\Aecli_[A-Za-z0-9_-]+\\z"))] | .[0] // ""' "$file" 2>/dev/null || true
 }
-eragon_device_sign_in() {
-  local label host poll_status poll_interval poll_expires poll_waited poll_started user_code verification_url browser
+# One device authorization: start it, show the link and code, and poll until the
+# browser answers. $1 is sign-in, or key for a Gateway key alone, which leaves the
+# current sign-in as it is; $2 is 1 to ask for a Gateway key with a sign-in. The
+# issued answer is left in http_body. An Eragon that can mint the key echoes the
+# request; one that does not sets create_unsupported, and a key-only request then
+# returns without polling, since an older Eragon would treat it as a sign-in.
+eragon_device_flow() {
+  local flow=$1 ask_key=$2 label host poll_status poll_interval poll_expires poll_waited poll_started
+  local user_code verification_url browser echoed
+  if [[ "$flow" == key ]]; then ask_key=1; fi
   host=${HOSTNAME:-localhost}
   label="eragon-router (${USER:-$(id -un 2>/dev/null || true)}@${host%%.*})"
-  start_request=$(jq -cn --arg label "$label" \
-    '{label: ($label | explode | map(select(. >= 32 and . < 127)) | implode | .[:120])}')
+  start_request=$(jq -cn --arg label "$label" --arg flow "$flow" --argjson key "$ask_key" '
+    {label: ($label | explode | map(select(. >= 32 and . < 127)) | implode | .[:120])} +
+    (if $key == 1 then {gatewayKey: true} else {} end) + (if $flow == "key" then {signIn: false} else {} end)')
   label=$(printf '%s' "$start_request" | jq -r '.label')
   http_response=$(printf '%s' "$start_request" | eragon_post /v1/auth/device/start) ||
     fail "Could not reach $eragon_url. Check the Eragon URL and your network, then retry."
@@ -398,11 +416,25 @@ eragon_device_sign_in() {
   poll_expires=$(answer_number expiresIn 1 86400)
   [[ -n "$poll_request" && -n "$user_code" && -n "$verification_url" ]] ||
     fail "Unexpected answer from $eragon_url when starting sign-in."
+  if [[ "$ask_key" == 1 ]]; then
+    echoed=$(printf '%s' "$http_body" | jq -r --arg flow "$flow" '
+      if .gatewayKey == true and ($flow != "key" or .signIn == false) then "yes" else "no" end' 2>/dev/null) || echoed=no
+    if [[ "$echoed" != yes ]]; then
+      create_unsupported=1
+      # Never polled: nobody saw this code, so nobody can approve it, and it expires.
+      if [[ "$flow" == key ]]; then unset start_request poll_request http_response http_body; return 0; fi
+    fi
+  fi
   # Ctrl-C while waiting stores nothing; the terminal is never changed here.
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  printf 'Open  %s\nCode  %s\n\nApprove "%s" in your browser. Waiting… (Ctrl-C to cancel)\n' \
-    "$verification_url" "$user_code" "$label" >&2
+  if [[ "$flow" == key ]]; then
+    printf 'Open  %s\nCode  %s\n\nApprove and create the key in your browser. Waiting… (Ctrl-C to cancel)\n' \
+      "$verification_url" "$user_code" >&2
+  else
+    printf 'Open  %s\nCode  %s\n\nApprove "%s" in your browser. Waiting… (Ctrl-C to cancel)\n' \
+      "$verification_url" "$user_code" "$label" >&2
+  fi
   if [[ "$no_browser" == 0 && "$verification_url" == https://* ]]; then
     browser=''
     case "$(uname -s 2>/dev/null || true)" in
@@ -437,10 +469,45 @@ eragon_device_sign_in() {
     esac
   done
   trap - INT TERM
+  unset start_request poll_request http_response
+}
+# The Gateway key in the issued answer, checked before anything is used or stored:
+# an esk_ secret that ends with its four-character secretLast4, and a string name,
+# cleaned like any server text. Sets new_key, the secret, and new_key_label, both
+# empty when the answer carries no key. Any other shape stops here, before the
+# caller stores anything. The secret reaches jq on stdin only, like a pasted key.
+read_new_key() {
+  local key_check="$jq_clean"'
+    def cut($width): if length > $width then .[:$width - 1] + "…" else . end;
+    if type == "object" and .gatewayKey != null then .gatewayKey else empty end | . as $key |
+    if type == "object" and (.secret | type) == "string" and (.secretLast4 | type) == "string" and
+      (.name | type) == "string" and (.secret | test("\\Aesk_[A-Za-z0-9_-]{4,}\\z")) and
+      (.secretLast4 | length) == 4 and (.secret | endswith($key.secretLast4))
+    then . else error("unusable key") end'
+  new_key_label=$(printf '%s' "$http_body" | jq -r "$key_check"' |
+    (.name | clean | if . == "" then "(unnamed key)" else cut(44) end) + " …" + .secretLast4' 2>/dev/null) &&
+    new_key=$(printf '%s' "$http_body" | jq -r "$key_check"' | .secret' 2>/dev/null) ||
+    fail "Unexpected key from $eragon_url. Nothing was stored; revoke the new key at $eragon_url/ai-gateway/keys."
+}
+# Use the created key like a pasted one, and skip the paste.
+use_new_key() {
+  eragon_key=$new_key; created_here=1
+  unset new_key
+  printf 'Created %s for this machine.\n' "$new_key_label"
+}
+# A new sign-in. Without an esk_ key saved for this Gateway it also asks for a
+# Gateway key for this machine; with one, the key list shows that key saved here.
+eragon_device_sign_in() {
+  local ask_key=0
+  if [[ "$saved_key" != esk_* || "${#saved_key}" -lt 8 ]]; then ask_key=1; fi
+  eragon_device_flow sign-in "$ask_key"
   eragon_token=$(printf '%s' "$http_body" | jq -r 'if (.token | type) == "string" and
     (.token | test("\\Aecli_[A-Za-z0-9_-]+\\z")) then .token else "" end' 2>/dev/null) || eragon_token=''
-  unset start_request poll_request http_response http_body
   [[ -n "$eragon_token" ]] || fail "Unexpected answer from $eragon_url while waiting for approval."
+  # A key this sign-in did not ask for is ignored, never used or stored.
+  new_key=''; new_key_label=''
+  if [[ "$ask_key" == 1 ]]; then read_new_key; fi
+  unset http_body
   # The new sign-in proves itself before anything is written.
   check_sign_in
   [[ "$sign_in_state" == valid ]] || fail 'Approved, but Eragon did not accept the new sign-in. Nothing was stored.'
@@ -449,6 +516,23 @@ eragon_device_sign_in() {
     split("\n") as [$token, $email] | $saved[0] |
     .sign_ins = ((.sign_ins // {}) + {($url): ({token: $token, createdAt: (now | todate)} +
       (if ($email // "") == "" then {} else {email: $email} end))})'
+  if [[ -n "$new_key" ]]; then use_new_key; fi
+}
+# A Gateway key alone, for someone already signed in: the request is public and
+# carries no credential, the stored sign-in is left as it is, and any token in
+# the answer is ignored. Sets eragon_key when Eragon hands over a key; leaves it
+# empty, after saying why, when this Eragon cannot create keys this way.
+eragon_create_key() {
+  if [[ "$create_unsupported" == 0 ]]; then eragon_device_flow key 0; fi
+  if [[ "$create_unsupported" == 1 ]]; then
+    printf 'This Eragon cannot create keys during sign-in yet. Create one at %s/ai-gateway/keys, then paste it.\n' "$eragon_url"
+    return 0
+  fi
+  new_key=''; new_key_label=''
+  read_new_key
+  unset http_body
+  [[ -n "$new_key" ]] || fail "Unexpected answer from $eragon_url while waiting for approval. Nothing was stored."
+  use_new_key
 }
 # Reuse the router's sign-in, then the eragon CLI's, before asking the browser.
 eragon_sign_in() {
@@ -478,7 +562,8 @@ eragon_sign_in() {
 }
 # Your own active Gateway keys: created by you, not provisioned by a partner.
 # A key whose last four characters match the key saved for this Gateway uses
-# that saved secret; any other key asks for its secret with hidden input.
+# that saved secret; any other key asks for its secret with hidden input. Both
+# menus can also ask Eragon for a new key for this machine, approved in the browser.
 eragon_choose_key() {
   local saved_last4='' saved_index='' hidden_keys hidden_note='' chosen_key='' index key_line key_choice
   local default_key paste_prompt row_last4 row_unique row_name row_details
@@ -540,15 +625,16 @@ eragon_choose_key() {
   if [[ "${hidden_keys:-0}" == 1 ]]; then hidden_note='1 expired or revoked key hidden.'
   elif [[ "${hidden_keys:-0}" != 0 ]]; then hidden_note="$hidden_keys expired or revoked keys hidden."; fi
   if [[ "${#key_names[@]}" == 0 ]]; then
-    printf '\nYou have no active Gateway keys. Create one at %s/ai-gateway/keys, then run again.\n' "$eragon_url"
+    printf '\nYou have no active Gateway keys.\n'
     if [[ -n "$hidden_note" ]]; then printf '%s\n' "$hidden_note"; fi
-    printf '  1) Paste a key\n  q) Quit\n'
+    printf '  1) Create a key for this machine (approve in your browser)\n  2) Paste a key\n  q) Quit\n'
     while true; do
       read -r -p 'Key action [1]: ' key_choice || fail 'Key selection cancelled.'
       case "${key_choice:-1}" in
-        1) return 0 ;;
+        1) eragon_create_key; if [[ -n "$eragon_key" ]]; then return 0; fi ;;
+        2) return 0 ;;
         q|Q) exit 1 ;;
-        *) printf 'Enter 1 or q.\n' ;;
+        *) printf 'Enter 1, 2 or q.\n' ;;
       esac
     done
   fi
@@ -560,19 +646,22 @@ eragon_choose_key() {
     printf '%s\n' "$key_line"
     if [[ -n "${key_details[index]}" ]]; then printf '     %s\n' "${key_details[index]}"; fi
   done
-  printf '  q) Quit\n'
+  printf '  n) Create a new key for this machine (approve in your browser)\n  q) Quit\n'
   if [[ -n "$hidden_note" ]]; then printf '%s\n' "$hidden_note"; fi
   default_key=1
   if [[ -n "$saved_index" ]]; then default_key=$((saved_index + 1)); fi
   while true; do
     read -r -p "Key number [$default_key]: " key_choice || fail 'Key selection cancelled.'
     key_choice=${key_choice:-$default_key}
-    case "$key_choice" in q|Q) exit 0 ;; esac
+    case "$key_choice" in
+      q|Q) exit 0 ;;
+      n|N) eragon_create_key; if [[ -n "$eragon_key" ]]; then return 0; fi; continue ;;
+    esac
     for ((index=0; index<${#key_names[@]}; index++)); do
       if [[ "$key_choice" == "$((index + 1))" ]]; then chosen_key=$index; fi
     done
     if [[ -n "$chosen_key" ]]; then break; fi
-    printf 'Enter one of the key numbers above, or q.\n'
+    printf 'Enter one of the key numbers above, n or q.\n'
   done
   if [[ "$chosen_key" == "$saved_index" ]]; then
     eragon_key=$saved_key
@@ -635,9 +724,10 @@ if [[ -z "$eragon_key" && "$eragon_choice" == 0 && -n "$eragon_url" && "$using_s
 fi
 if [[ "$eragon_choice" == 1 ]]; then
   eragon_sign_in
-  eragon_choose_key
+  # A key created with a new sign-in is used directly; otherwise choose one.
+  if [[ -z "$eragon_key" ]]; then eragon_choose_key; fi
 fi
-unset eragon_token stored_sign_in saved_key eragon_user eragon_email
+unset eragon_token stored_sign_in saved_key eragon_user eragon_email new_key
 if [[ -z "$eragon_key" ]]; then
   [[ -t 0 && -t 1 ]] || fail 'Set ERAGON_API_KEY or run in an interactive terminal to enter a key.'
   read_hidden 'Personal API Key: '
@@ -870,7 +960,18 @@ else
 fi
 unset classification rows limits
 
-if [[ "$prompted_key" == 1 && "$remember_key" == 0 ]]; then
+if [[ "$created_here" == 1 && "$remember_key" == 0 ]]; then
+  # Yes by default for this key only: Eragon keeps no copy of its secret to show again.
+  printf '%s\n' "Eragon cannot show this key's secret again. Saving uses an owner-only plaintext file."
+  while true; do
+    read -r -p 'Save this key on this machine? [Y/n]: ' remember_choice || fail 'Credential saving cancelled.'
+    case "$remember_choice" in
+      ''|y|Y|yes|Yes|YES) remember_key=1; break ;;
+      n|N|no|No|NO) break ;;
+      *) printf 'Enter y or n.\n' ;;
+    esac
+  done
+elif [[ "$prompted_key" == 1 && "$remember_key" == 0 ]]; then
   read -r -p 'Remember API key locally (owner-only plaintext file)? [y/N]: ' remember_choice || fail 'Credential saving cancelled.'
   case "$remember_choice" in y|Y|yes|YES) remember_key=1 ;; esac
 fi
